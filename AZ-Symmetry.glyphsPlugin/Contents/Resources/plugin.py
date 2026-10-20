@@ -8982,25 +8982,14 @@ def _bind_metrics_key(layer, mode: str, unpaired: bool) -> bool:
     and the sync after a keyed bind would give tildecomb, inked from x 155 to
     453, a width of 608.
 
-    The previous key is saved whenever the layer's key is not already OURS.
-    That is an ownership test, not a "has anything been saved yet" test, and the
-    difference is a data-loss bug: gating the save on the store being empty
-    meant a second keyed bind wrote "==|" over whatever the designer had typed
-    since the first one, saved nothing, printed nothing, and left the stale
-    first-bind value in the store for the release to write back over their own.
-    Typing "==n" in the inspector reaches exactly this — ``-[GSLayer(MetricsKeysUI)
-    _setMetricsKeyUI:side:]`` routes a "=="-prefixed value through
-    ``setPlainMetricsKey:side:`` to ``-[GSLayer setRightMetricsKey:]``, i.e. to
-    the LAYER, which is the key this reads.
-
-    The ownership test subsumes the old guard: on a second bind the key already
-    reads "==|", so nothing is re-saved and the designer's original survives.
-    What it adds is the retype and the deletion in between, which the old guard
-    could not see.
-
-    ``str(previous) if previous else ""`` because ``_write_userdata(..., None)``
-    DELETES the entry — None cannot be stored, so the empty string means "there
-    was no key of your own" — and because a reopened file hands back NSString.
+    A key already set is left exactly as it is (issue #2, schriftgestalt: "Why
+    not just leave it as it is?"): the layer's own, the designer's own "==|"
+    included, and the glyph's, which a layer key would override on this master.
+    Ours goes only where there is no key. The empty string is saved beside it,
+    so the release knows the key is ours to clear, and a "==|" with that entry
+    is ours already and kept for a second mode. A non-empty saved value comes
+    only from an older build, which overwrote keys; the release still gives it
+    back.
 
     The mode is then recorded in METRICS_KEY_OWNERS, so a later release can ask
     which bindings actually earned the key rather than which ones merely could
@@ -9046,10 +9035,24 @@ def _bind_metrics_key(layer, mode: str, unpaired: bool) -> bool:
             return False
         previous = layer.rightMetricsKey
         current = str(previous) if previous else ""
-        if current != RIGHT_METRICS_KEY:
-            if not _write_userdata(layer, METRICS_KEY_STORE, current):
+        ours = _read_userdata(layer, METRICS_KEY_STORE) is not None
+        if current and not (ours and current == RIGHT_METRICS_KEY):
+            print(
+                f'[AZ Symmetrify] this layer already has a right metrics key, "{current}", '
+                "so it was left as it is."
+            )
+            return False
+        if not current:
+            glyph_key = layer.parent.rightMetricsKey
+            if glyph_key:
+                print(
+                    f'[AZ Symmetrify] this glyph already has a right metrics key, "{glyph_key}", '
+                    "so the layer was given none of its own."
+                )
                 return False
-        _write_right_metrics_key(layer, RIGHT_METRICS_KEY)
+            if not _write_userdata(layer, METRICS_KEY_STORE, ""):
+                return False
+            _write_right_metrics_key(layer, RIGHT_METRICS_KEY)
         owners = _key_owners(layer) or set()
         owners.add(mode)
         if not _write_userdata(layer, METRICS_KEY_OWNERS, sorted(owners)):
@@ -9168,8 +9171,8 @@ def _release_metrics_key(layer, remaining: set) -> None:
 
     The restore is CONDITIONAL on the layer's key still being ours. Nothing
     stops the designer retyping it — or deleting it — in the inspector while the
-    symmetry is bound, and this write registers no undo, so putting the saved
-    value back over theirs would destroy work with nothing to recover it from.
+    symmetry is bound, and putting the saved value back over theirs would
+    destroy their work.
     A key that is no longer "==|" means the designer has taken the key back, so
     the marker is dropped and their value is left exactly as it stands. The
     deletion case reads the same way: an empty key is not "==|" either, so a key
