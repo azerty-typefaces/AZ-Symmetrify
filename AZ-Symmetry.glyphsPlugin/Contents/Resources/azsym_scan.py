@@ -40,6 +40,13 @@ Those two clusters are separated by the gap from 2.62% to 7.59%, and that gap is
 the boundary between HAVING a symmetry and not having it. It is not the same
 question as whether binding is SAFE, and the module now draws both lines:
 
+The scan now measures how far the OUTLINE moves, not the furthest node
+(issue #3): never more, and less wherever a handle moved, since a curve moves by
+at most 3/4 of its handle. The lines below were kept, re-checked on a real
+test font (2026-10-20): at the same 5% the window lists 18 more layers, 11 of
+them real symmetries and 7 loose italic mirrors, and 48 rows (dots, rings,
+zeros) rise to Safe.
+
 ``SAFE_SHARE`` (0.5%) is the safe line — the snap moves nothing the designer
 would see, so binding is a tidy-up rather than an edit. ``NEAR_SHARE`` (5%) is
 the measured have-it line above. Between them sits a glyph that genuinely has
@@ -82,6 +89,10 @@ import azsym_binding
 import azsym_native
 from azsym_binding import Paths
 from azsym_geometry import MODES, Point, centre_of
+
+# Per point, whether it is an off-curve handle. Given, the scan measures how far
+# the drawn outline moves; left out, how far the furthest point moves.
+OffCurve = list[list[bool]]
 
 # Symmetries the SURVEY proposes as a pair rather than one at a time.
 #
@@ -160,7 +171,7 @@ def bound_name(bound: tuple[str, ...]) -> str:
     return combo_name(tuple(mode for mode in MODES if mode in bound))
 
 
-# Share of the outline's own diagonal a bind snap may move a node and still
+# Share of the outline's own diagonal a bind snap may move the outline and still
 # count as safe. Half a percent: on a 1000-unit glyph that is five units, which
 # is the point below which a designer would not see the snap happen.
 # The rule lives in native/kernel.h; change both.
@@ -200,7 +211,7 @@ def safe_units(upm: float = DEFAULT_UPM) -> float:
 # with its number rather than decided.
 NEAR_SHARE = 0.05
 
-# Furthest a proposal may move a node and still be worth LISTING at all (Hugo,
+# Furthest a proposal may move the outline and still be worth LISTING at all (Hugo,
 # 2026-08-11). Above it the row is dropped from the window: a snap that shoves a
 # node this far is not a tidy-up whatever percentage it works out at, and rows
 # nobody would press Apply on are what buries the ones they would.
@@ -360,9 +371,22 @@ def buried_nodes(paths: Paths) -> set[tuple[int, int]]:
 
 
 def measure(
-    paths: Paths, centre: Point, mode: str, shear: float, upm: float = DEFAULT_UPM
+    paths: Paths,
+    centre: Point,
+    mode: str,
+    shear: float,
+    upm: float = DEFAULT_UPM,
+    offcurve: OffCurve | None = None,
 ) -> Candidate:
     """What binding ``mode`` to this outline would cost, without binding it.
+
+    The cost is how far the drawn OUTLINE would move: per segment, the furthest
+    the curve goes (issue #3, schriftgestalt: "It seems the curves confuse the
+    classifier?"). A handle moved by d moves its curve by at most 3/4 d, so
+    quoting the handle's own move put a dot with handles a few units uneven in
+    the yellow. ``offcurve`` says which points are handles; without it the
+    furthest point is quoted, as the Python kernel the engine was ported from
+    did, and the parity corpus still checks that.
 
     BOTH source sides are measured and the WORSE is quoted, because which half
     the designer keeps is decided by the selection at bind time and the scan
@@ -380,7 +404,7 @@ def measure(
     not zero, and a scanner that rounded it to zero would be asserting an
     identity that is false.
     """
-    return _candidate(azsym_native.measure(paths, centre, mode, shear, upm), mode)
+    return _candidate(azsym_native.measure(paths, centre, mode, shear, upm, offcurve), mode)
 
 
 def is_safe(shift: float, share: float, upm: float = DEFAULT_UPM) -> bool:
@@ -488,7 +512,11 @@ def settlement(paths: Paths, modes: tuple[str, ...], shear: float) -> tuple[Path
 
 
 def measure_combo(
-    paths: Paths, modes: tuple[str, ...], shear: float, upm: float = DEFAULT_UPM
+    paths: Paths,
+    modes: tuple[str, ...],
+    shear: float,
+    upm: float = DEFAULT_UPM,
+    offcurve: OffCurve | None = None,
 ) -> Candidate:
     """What binding several symmetries at once would cost, without binding them.
 
@@ -508,7 +536,9 @@ def measure_combo(
     horizontal one first", so a row offering a pair that only works one way
     round would be an instruction the designer cannot read.
     """
-    return _candidate(azsym_native.measure_combo(paths, modes, shear, upm), combo_name(modes))
+    return _candidate(
+        azsym_native.measure_combo(paths, modes, shear, upm, offcurve), combo_name(modes)
+    )
 
 
 def scan_layer(
@@ -516,6 +546,7 @@ def scan_layer(
     shear: float,
     ceiling: int = NODE_CEILING,
     upm: float = DEFAULT_UPM,
+    offcurve: OffCurve | None = None,
 ) -> LayerScan:
     """Measure all three symmetries against one layer's outline.
 
@@ -529,7 +560,7 @@ def scan_layer(
     nodes. Scanning against a different centre than the bind would use would
     make the report a description of some other operation.
     """
-    return scan_from_native(azsym_native.scan_layer(paths, shear, ceiling, upm, COMBOS))
+    return scan_from_native(azsym_native.scan_layer(paths, shear, ceiling, upm, COMBOS, offcurve))
 
 
 # --------------------------------------------------------------- a whole file

@@ -41,6 +41,7 @@ COMBO_BASE = 100
 
 _I32P = ctypes.POINTER(ctypes.c_int32)
 _F64P = ctypes.POINTER(ctypes.c_double)
+_U8P = ctypes.POINTER(ctypes.c_uint8)
 
 _SIGNATURES: dict[str, tuple[Any, list[Any]]] = {
     "azs_source_hash": (ctypes.c_char_p, []),
@@ -157,6 +158,15 @@ def _pack(paths: Sequence[Sequence[Sequence[float]]]) -> tuple[int, Any, Any, in
         (ctypes.c_double * len(values))(*values),
         sum(lengths),
     )
+
+
+def _offcurve(offcurve: Sequence[Sequence[bool]] | None) -> Any:
+    """One flag per point, 1 for an off-curve handle, in ``_pack``'s order; None
+    (NULL) when the kinds are unknown, which measures point by point."""
+    if offcurve is None:
+        return None
+    flags = [1 if flag else 0 for path in offcurve for flag in path]
+    return (ctypes.c_uint8 * max(len(flags), 1))(*flags)
 
 
 def _upm(upm: Any) -> float:
@@ -485,8 +495,8 @@ _SIGNATURES.update(
         "azs_buried_nodes": (ctypes.c_int32, [ctypes.c_int32, _I32P, _F64P, _I32P, _I32P]),
         "azs_measure": (
             ctypes.c_int32,
-            [ctypes.c_int32, _I32P, _F64P, ctypes.c_double, ctypes.c_double, ctypes.c_int32,
-             ctypes.c_double, ctypes.c_double, ctypes.POINTER(_Candidate)],
+            [ctypes.c_int32, _I32P, _F64P, _U8P, ctypes.c_double, ctypes.c_double,
+             ctypes.c_int32, ctypes.c_double, ctypes.c_double, ctypes.POINTER(_Candidate)],
         ),
         "azs_reshape": (
             ctypes.c_int32,
@@ -518,14 +528,15 @@ def buried_nodes(paths: Sequence[Sequence[Any]]) -> set[tuple[int, int]]:
 
 
 def measure(
-    paths: Sequence[Sequence[Any]], centre: Any, mode: str, shear: float, upm: Any
+    paths: Sequence[Sequence[Any]], centre: Any, mode: str, shear: float, upm: Any,
+    offcurve: Sequence[Sequence[bool]] | None = None,
 ) -> RawCandidate:
     contours, lengths, xy, _nodes = _pack(paths)
     out = _Candidate()
     _check(
         lib().azs_measure(
-            contours, lengths, xy, centre[0], centre[1], mode_code(mode), shear, _upm(upm),
-            ctypes.byref(out),
+            contours, lengths, xy, _offcurve(offcurve), centre[0], centre[1], mode_code(mode),
+            shear, _upm(upm), ctypes.byref(out),
         )
     )
     return _raw(out)
@@ -555,12 +566,13 @@ _SIGNATURES.update(
     {
         "azs_measure_combo": (
             ctypes.c_int32,
-            [ctypes.c_int32, _I32P, _F64P, _I32P, ctypes.c_int32, ctypes.c_double,
+            [ctypes.c_int32, _I32P, _F64P, _U8P, _I32P, ctypes.c_int32, ctypes.c_double,
              ctypes.c_double, ctypes.POINTER(_Candidate)],
         ),
         "azs_scan_layer": (
             ctypes.c_int32,
-            [ctypes.c_int32, _I32P, _F64P, ctypes.c_double, ctypes.c_int32, ctypes.c_double,
+            [ctypes.c_int32, _I32P, _F64P, _U8P, ctypes.c_double, ctypes.c_int32,
+             ctypes.c_double,
              _I32P, _I32P, ctypes.c_int32, ctypes.POINTER(_Candidate), _I32P, _I32P, _I32P,
              _F64P],
         ),
@@ -577,14 +589,16 @@ def _combos(combos: Sequence[Sequence[str]]) -> tuple[Any, Any]:
 
 
 def measure_combo(
-    paths: Sequence[Sequence[Any]], modes: Sequence[str], shear: float, upm: Any
+    paths: Sequence[Sequence[Any]], modes: Sequence[str], shear: float, upm: Any,
+    offcurve: Sequence[Sequence[bool]] | None = None,
 ) -> RawCandidate:
     contours, lengths, xy, _nodes = _pack(paths)
     out = _Candidate()
     _check(
         lib().azs_measure_combo(
-            contours, lengths, xy, _ints([mode_code(mode) for mode in modes] or [0]), len(modes),
-            shear, _upm(upm), ctypes.byref(out),
+            contours, lengths, xy, _offcurve(offcurve),
+            _ints([mode_code(mode) for mode in modes] or [0]), len(modes), shear, _upm(upm),
+            ctypes.byref(out),
         )
     )
     return _raw(out)
@@ -592,7 +606,7 @@ def measure_combo(
 
 def scan_layer(
     paths: Sequence[Sequence[Any]], shear: float, ceiling: int, upm: Any,
-    combos: Sequence[Sequence[str]],
+    combos: Sequence[Sequence[str]], offcurve: Sequence[Sequence[bool]] | None = None,
 ) -> tuple[tuple[RawCandidate, ...], int, int, float]:
     """``(candidates, skipped code or -1, nodes, reach)``."""
     contours, lengths, xy, _nodes = _pack(paths)
@@ -602,7 +616,8 @@ def scan_layer(
     reach = ctypes.c_double()
     _check(
         lib().azs_scan_layer(
-            contours, lengths, xy, shear, ceiling, _upm(upm), combo_modes, combo_lengths,
+            contours, lengths, xy, _offcurve(offcurve), shear, ceiling, _upm(upm), combo_modes,
+            combo_lengths,
             len(combos), out, ctypes.byref(count), ctypes.byref(skipped), ctypes.byref(nodes),
             ctypes.byref(reach),
         )

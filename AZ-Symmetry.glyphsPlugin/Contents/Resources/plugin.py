@@ -695,7 +695,7 @@ BATCH_SOURCE_SIGN = -1
 # layer of the glyph already named above.
 #
 # "Outline changes" and not "Moves" (Hugo). The bar measures how far binding
-# would shove the furthest node, which is a change to the outline; "Moves"
+# would move the outline (issue #3: the curve, not its handles); "Moves"
 # reads as a count of them. It draws the HEADROOM left under the ceiling rather
 # than the movement itself — see MOVE_BAR_WARNING_PER_UPM — so the identifier
 # says headroom even though the column is titled for what it is about.
@@ -4192,7 +4192,7 @@ def _remeasure_layer(glyph_name: str, master_id: str) -> tuple:
     finding = azsym_scan.LayerFinding(
         glyph=glyph_name,
         master=_master_name(layer),
-        scan=azsym_scan.scan_layer(_paths_of(layer), _shear_of(layer), upm=upm),
+        scan=_scan_of(layer, upm),
         components=_holds_components(layer),
         bound=tuple(sorted(_bound_modes(layer))),
         master_id=_master_id(layer),
@@ -6182,7 +6182,7 @@ class AZSymmetry(GeneralPlugin):
                         azsym_scan.LayerFinding(
                             glyph=str(glyph.name),
                             master=_master_name(layer),
-                            scan=azsym_scan.scan_layer(_paths_of(layer), _shear_of(layer), upm=upm),
+                            scan=_scan_of(layer, upm),
                             components=_holds_components(layer),
                             bound=tuple(sorted(_bound_modes(layer))),
                             master_id=_master_id(layer),
@@ -8299,6 +8299,14 @@ def _structure_of(layer) -> azsym_topology.Structure:
         paths.append(points)
         types.append(encoded)
     return azsym_topology.Structure(paths=paths, types=types)
+
+
+def _scan_of(layer, upm: float) -> azsym_scan.LayerScan:
+    """Analyze's measure of one layer, with its node types: a handle counts by
+    how far it moves the curve, not by its own move (issue #3)."""
+    structure = _structure_of(layer)
+    offcurve = [[kind == azsym_topology.OFFCURVE for kind in path] for path in structure.types]
+    return azsym_scan.scan_layer(structure.paths, _shear_of(layer), upm=upm, offcurve=offcurve)
 
 
 def _holds_components(layer) -> bool:
