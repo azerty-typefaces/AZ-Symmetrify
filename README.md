@@ -74,6 +74,14 @@ The glyph previews the new split while you type. Typing an angle is the instruct
 
 <br>
 
+## Several Symmetries on One Glyph
+
+Select whole paths, then click a switch: the symmetry covers only those paths, about the centre of their own box. A glyph can carry several this way, like the `S` of a `$` turned with **Custom** and its bar mirrored left to right.
+
+Each symmetry shows its generated half in blue. Select its paths, or any node in them, to see its dashed axis, light its switches, and switch it off. A path belongs to one symmetry at a time.
+
+<br>
+
 ## Browse and Analyze
 
 Open *Window ▸ AZ Toolkit ▸ Symmetrify*.
