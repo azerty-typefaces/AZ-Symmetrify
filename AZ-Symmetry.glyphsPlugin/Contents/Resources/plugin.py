@@ -47,6 +47,7 @@ from AppKit import (
     NSApplication,
     NSAttributedString,
     NSBezierPath,
+    NSButton,
     NSColor,
     # Foundation, re-exported by AppKit in PyObjC. With NSRunLoop below, these
     # give the scan's progress sheet one turn of the run loop to appear in —
@@ -461,6 +462,7 @@ UNDO_NOTIFICATIONS = (
     "NSUndoManagerDidUndoChangeNotification",
     "NSUndoManagerDidRedoChangeNotification",
 )
+UNDO_STEP_CLOSING = "NSUndoManagerWillCloseUndoGroupNotification"
 # Where the palette sits in the sidebar, which sorts on it ascending. Read live,
 # 2026-10-10: Dimensions 10, Fit Curve 20, Layers 30, Italify Groups 35, AZ Camera
 # 40, Transformations 40. Hugo wants it just above Transformations; the sidebar
@@ -489,6 +491,36 @@ DIAGONAL_DEGREE_WIDTH = 14.0
 DIAGONAL_GAP = 4.0
 # Between the switches and the Diagonal row.
 PALETTE_ROW_GAP = 6.0
+# The swap triangle (Hugo, 2026-10-21): in each lit switch, beside its icon,
+# pointing at the half its symmetry has the designer draw. A click swaps it. A
+# TRIANGLE_SIZE triangle in the middle of a TRIANGLE_HIT chip at partial alpha,
+# so it reads as a button ("make it more obvious that users can click it").
+#
+# Icon, SWAP_GAP and chip are ONE image the switch centres (Hugo's mock-up,
+# 2026-10-22), so the switch inks the chip as it inks the icon: white on blue
+# while the window is active, grey when it is not. A lit switch splits in two
+# (Hugo, 2026-10-22): its left half switches it off, and a transparent button
+# over its right half, chip and all, swaps the side. Icon and chip are the same
+# width, so the switch's middle falls in the gap.
+TRIANGLE_SIZE = 7.0
+TRIANGLE_HIT = 13.0
+TRIANGLE_CHIP_ALPHA = 0.25
+TRIANGLE_CHIP_RADIUS = 3.0
+# The share of its ink a chip that cannot swap is drawn with.
+TRIANGLE_DIMMED = 0.35
+SWAP_GAP = 5.0
+SWAP_GROUP = SEGMENT_ICON_SIZE + SWAP_GAP + TRIANGLE_HIT
+# Each half's triangle, y up, keyed by ``azsym_geometry.side_labels``' names.
+TRIANGLES = {
+    "Left": ((6.5, 0.5), (0.5, 3.5), (6.5, 6.5)),
+    "Right": ((0.5, 0.5), (6.5, 3.5), (0.5, 6.5)),
+    "Bottom": ((0.5, 6.0), (6.5, 6.0), (3.5, 1.0)),
+    "Top": ((0.5, 1.0), (6.5, 1.0), (3.5, 6.0)),
+    "Bottom Left": ((0.5, 0.5), (0.5, 6.5), (6.5, 0.5)),
+    "Top Right": ((6.5, 6.5), (0.5, 6.5), (6.5, 0.5)),
+}
+SWAP_DORMANT = "It no longer mirrors the outline: switch it off and on again to rebind it"
+SWAP_UNPAIRED = "Some of its nodes have no partner, so the other half cannot take over"
 # The commands AppKit sends the field's delegate for ↑/↓, and for ⇧↑/⇧↓ (probed
 # on Glyphs 3532 and 4202: they arrive as str), in degrees (Hugo, 2026-10-15).
 DIAGONAL_STEPS = {
@@ -521,6 +553,11 @@ ROUNDED_SEGMENTS = NSSegmentStyleRounded
 FILL_EQUALLY = 2
 # NSView.h: NSViewWidthSizable = 2.
 WIDTH_SIZABLE = 2
+# NSView.h: MinXMargin = 1 and MaxXMargin = 4. With the width, all three stretch,
+# so a resize is shared in proportion and each switch's overlay keeps its third.
+THIRD_RESIZING = 1 | WIDTH_SIZABLE | 4
+# NSDocument.h: NSChangeDone = 0.
+NS_CHANGE_DONE = 0
 # NSTrackingArea.h. Written out like the two above rather than imported, and
 # each value read back from the real AppKit rather than recited.
 TRACK_ENTER_EXIT = 0x01  # NSTrackingMouseEnteredAndExited
@@ -540,6 +577,15 @@ STALE_COLOR = NSColor.systemRedColor
 # Bound and mirroring, but some nodes found no partner and are not being
 # mirrored. Distinct from both: it is neither healthy nor a reason to re-bind.
 UNPAIRED_COLOR = NSColor.systemOrangeColor
+# Over a generated handle a selected node would drag but cannot move
+# (``azsym_sync.stranded_handles``): a half-strength dot, radius in SCREEN
+# points, over Glyphs' own hollow mark, and the sign above it. The wash and the
+# axis go orange with it.
+STRANDED_SIGN = "\u26a0\ufe0f"
+STRANDED_DOT_RADIUS = 3.5
+STRANDED_DOT_ALPHA = 0.5
+# What GSNode.type reads, and nothing else in a selection does.
+NODE_TYPES = ("line", "curve", "qcurve", "offcurve")
 
 
 def BOUND_COLOR():
@@ -3716,7 +3762,7 @@ def _previewable(mode: str, layer) -> bool:
         bound = _bound_modes(layer)
         return (
             mode not in bound
-            and _segment_enabled(mode, bound)
+            and _segment_enabled(mode, bound, bool(_shear_of(layer)))
             and not _impure(_PLUGIN, layer, mode)
         )
     except Exception:
@@ -4705,21 +4751,21 @@ class AZSymmetry(GeneralPlugin):
     def settings(self) -> None:
         self.name = MENU_TITLE
         # (glyph name, layer id) -> {node ref: position} from the previous frame.
-        self._snapshots: dict[str, dict] = {}
+        self._snapshots: dict[tuple, dict] = {}
         # (glyph name, layer id) -> the previous frame's Structure, for
         # classifying what structurally changed.
         # ``(structure, signature)``: the signature is cached beside the
         # structure it describes because it cannot change while that structure
         # sits here, and recomputing it was half the gate's per-frame cost.
-        self._structures: dict[str, tuple] = {}
+        self._structures: dict[tuple, tuple] = {}
         # Smooth nodes the live sync turned sharp, per layer, with the
         # connection each had: (structure signature, {node ref: connection}).
         # Stamped with the signature so a structural edit, which moves node
         # indices, discards it — see ``_keep_connections_honest``.
-        self._sharpened: dict[str, tuple] = {}
+        self._sharpened: dict[tuple, tuple] = {}
         # (glyph name, layer id) -> (store object, parsed axes). See
         # ``_axes_for_layer`` for why the store object is half the key.
-        self._axes: dict[str, tuple] = {}
+        self._axes: dict[tuple, tuple] = {}
         # (font, layer key, path symmetry id) -> (its GSPath objects as last
         # seen, the layer's path count then, the ones deleted) — see
         # ``_scoped_views``.
@@ -4771,6 +4817,15 @@ class AZSymmetry(GeneralPlugin):
         # The tick. Registered unconditionally and never removed: this is what
         # makes mirroring independent of anything the user can switch off.
         Glyphs.addCallback(self.tick, DRAWFOREGROUND)
+        # A node added or deleted on the drawn half is mirrored as the
+        # designer's undo step closes, so the mirror joins the step, and an
+        # undo or redo that brought both halves back is taken as it stands.
+        center = NSNotificationCenter.defaultCenter()
+        center.addObserver_selector_name_object_(
+            self, "undoStepWillClose:", UNDO_STEP_CLOSING, None
+        )
+        for name in UNDO_NOTIFICATIONS:
+            center.addObserver_selector_name_object_(self, "undoStepReplayed:", name, None)
         # Opening a file is the one moment the plugin can tell the designer that
         # a symmetry stopped being kept somewhere they were not looking. Guarded
         # separately: an older host without the constant must lose the notice,
@@ -4793,10 +4848,9 @@ class AZSymmetry(GeneralPlugin):
     def documentClosed(self, sender) -> None:
         """Drop every per-layer cache when any document closes.
 
-        ALL of them, and not just the closed font's. A cache key is a glyph
-        name and a layer id (see ``_snapshot_key``) and carries no font, so
-        there is nothing in a key to match a document against. Clearing the lot
-        is both simpler and nearly free, because every one of these caches is
+        ALL of them, and not just the closed font's: a key holds a glyph, and
+        reaching a closed glyph's font to match it is not worth it. Clearing the
+        lot is both simpler and nearly free, because every one of these caches is
         rebuilt from the layer itself: the structure on the next frame, the
         snapshot one frame after that, the axes on the next read of userData.
         A document closing therefore costs any other open document a single
@@ -4804,12 +4858,12 @@ class AZSymmetry(GeneralPlugin):
 
         Without this they outlived the font. Every layer bound in a file that
         was closed an hour ago still held its coordinates, and quitting Glyphs
-        was the only way to get them back. It also sweeps up what a RENAMED
-        glyph orphans — an entry filed under a name nothing will ask for again,
-        which nothing else will ever collect.
+        was the only way to get them back. It also lets go of the glyphs the
+        keys hold, deleted ones included.
         """
         self._snapshots.clear()
         self._structures.clear()
+        self._sharpened.clear()
         self._axes.clear()
         self._scope_paths.clear()
         _PENDING_ANGLES.clear()
@@ -4885,17 +4939,31 @@ class AZSymmetry(GeneralPlugin):
         (``_stored_split``): the stored sign names a half only on the split it
         was chosen on.
         """
-        applied = 0
+        applied = left = 0
         for glyph_name, master_id, modes in dormant:
             layer = _layer_in(font, glyph_name, master_id)
             if layer is None:
                 continue
+            italic = bool(_shear_of(layer))
             for mode in modes:
+                # On an italic a bind releases every symmetry it excludes, and
+                # one bound before that rule may still hold two: which to keep
+                # is the designer's call, not this loop's (review, 2026-10-22).
+                others = {azsym_geometry.switch_of(other) for other in _bound_modes(layer)}
+                others.discard(azsym_geometry.switch_of(mode))
+                if italic and others & set(azsym_geometry.excluded_by(mode, italic=True)):
+                    left += 1
+                    continue
                 if self._bind_layer(
                     layer, mode, _stored_sign(layer, mode), split=_stored_split(layer, mode)
                 ):
                     applied += 1
         print(f"[AZ Symmetrify] re-applied {applied} dormant binding(s).")
+        if left:
+            print(
+                f"[AZ Symmetrify] {left} left as they are: on an italic master only one "
+                "symmetry can be on at a time, so switch the others off first."
+            )
         self._refresh()
 
     @objc.python_method
@@ -5129,7 +5197,8 @@ class AZSymmetry(GeneralPlugin):
                         # frame's writes rather than lagging them by one. A
                         # bound half-turn's split as the Diagonal field previews it.
                         drawn = _with_field_split(group, axes)
-                        self._draw_axes(group, drawn, result.stale_axes, scale, points)
+                        warned = _stranded_points(group, axes, result.stale_axes)
+                        self._draw_axes(group, drawn, result.stale_axes, scale, points, warned)
                 except Exception:
                     _print_once(traceback.format_exc())
             if hidden is None and (_PREVIEW is not None or _FIELD_GHOST is not None):
@@ -5187,47 +5256,13 @@ class AZSymmetry(GeneralPlugin):
         # THE per-frame gate. classify() is O(n^2) and reconcile() re-derives
         # every pairing; neither may run on the sixty frames of a drag, where
         # positions change constantly and structure does not. signature() is
-        # deliberately blind to position, so dragging a node never trips it.
-        if cached is not None and cached[1] != current:
-            previous = cached[0]
-            change = azsym_topology.classify(previous, structure)
-            if isinstance(layer, _ScopedLayer) and change.kind in (
-                azsym_topology.CONTOUR_ADDED,
-                azsym_topology.CONTOUR_REMOVED,
-            ):
-                # A path symmetry never adds or removes a contour: a deletion
-                # or one put back by Cmd-Z is re-paired, never mirrored.
-                change = azsym_topology.Change(kind=azsym_topology.UNCLASSIFIED)
-            reconciled = azsym_sync.reconcile(structure, previous, axes, change)
-            if _apply_structure(layer, reconciled.edits):
-                # The edits moved node indices. Everything past this point —
-                # the sync, the snapshot, the structure cached for the next
-                # frame — has to read the outline that now exists rather than
-                # the one this frame started with, or every mirrored position
-                # is written to the wrong node.
-                structure = _structure_of(layer)
-                current = azsym_topology.signature(structure)
-                # And nothing else will invalidate the view: the write went
-                # through the non-reporting update pair, so a node that has
-                # just appeared or gone stays wrong on screen until some
-                # unrelated event repaints. Only on the frame the edits landed,
-                # which is why _apply_structure reports whether they did.
-                _request_repaint()
-            if reconciled.axes != tuple(axes):
-                # In place, because tick hands this same list to _draw_axes
-                # once the sync returns: drawn from the superseded binding, a
-                # re-derived axis reports the wrong unpaired count.
-                axes[:] = list(reconciled.axes)
-                self._persist(layer, axes)
-                # The snapshot is keyed by node index and those indices have
-                # just moved. It is unusable on its own terms too: every pair
-                # touching an inserted node is absent from it, and the pair
-                # guard refuses anything it cannot see was symmetric last
-                # frame, so the axis would report stale whatever the outline
-                # looks like. Dropping it sends sync down its previous-is-None
-                # path, which writes nothing this frame and rebuilds the
-                # snapshot on the new indices. Mirroring resumes next frame.
-                self._snapshots.pop(key, None)
+        # deliberately blind to position, so dragging a node never trips it, and
+        # so is a renumbering that keeps the node types in order (renumbered).
+        if cached is not None and (
+            cached[1] != current or azsym_topology.renumbered(cached[0], structure)
+        ):
+            structure = self._reconcile(layer, axes, key, cached[0], structure, _open_step(layer))
+            current = azsym_topology.signature(structure)
 
         self._structures[key] = (structure, current)
 
@@ -5283,8 +5318,133 @@ class AZSymmetry(GeneralPlugin):
         ]
         return result, points
 
+    def undoStepWillClose_(self, notification) -> None:
+        """A glyph's undo step is closing: mirror a node the designer added or
+        deleted on a bound layer NOW, while the step is open, so the mirror and
+        its binding join it (``_reconcile``). Probed on Glyphs 4202: an edit
+        made here lands in the closing step, and one Cmd-Z takes both back.
+        Only the outermost step, and never one an undo or redo is closing."""
+        try:
+            manager = notification.object()
+            if manager.groupingLevel() != 1 or manager.isUndoing() or manager.isRedoing():
+                return
+            for group in self._bound_groups(_glyph_of_undo(manager)):
+                key = _snapshot_key(group)
+                cached = self._structures.get(key)
+                if cached is None:
+                    continue
+                axes = self._axes_for_layer(group)
+                structure = _structure_of(group)
+                current = azsym_topology.signature(structure)
+                if not axes or (
+                    current == cached[1] and not azsym_topology.renumbered(cached[0], structure)
+                ):
+                    continue
+                structure = self._reconcile(group, axes, key, cached[0], structure, True)
+                self._structures[key] = (structure, azsym_topology.signature(structure))
+        except Exception:
+            _print_once(traceback.format_exc())
+
+    def undoStepReplayed_(self, notification) -> None:
+        """An undo or redo of a step the mirror joined puts both halves AND the
+        binding back together: take that outline as it stands, or the next
+        frame reads the nodes coming back as an edit and mirrors them again.
+        Only when the binding came back with it: one that did not (a mirror
+        made out of the step) is left to the frame to repair, as before."""
+        try:
+            for group in self._bound_groups(_glyph_of_undo(notification.object())):
+                key = _snapshot_key(group)
+                cached = self._structures.get(key)
+                if cached is None:
+                    continue
+                structure = _structure_of(group)
+                current = azsym_topology.signature(structure)
+                if current == cached[1] or any(
+                    azsym_sync.axis_is_stale(axis, structure.paths)
+                    for axis in self._axes_for_layer(group)
+                ):
+                    continue
+                self._structures[key] = (structure, current)
+                # Node indices moved under it.
+                self._snapshots.pop(key, None)
+        except Exception:
+            _print_once(traceback.format_exc())
+
     @objc.python_method
-    def _keep_connections_honest(self, layer, key: str, structure, actual: dict):
+    def _bound_groups(self, glyph) -> list:
+        """Every layer of ``glyph`` and each path symmetry on it, as ``tick``
+        syncs them."""
+        if glyph is None:
+            return []
+        return [group for layer in glyph.layers for group in (layer, *self._scoped_views(layer))]
+
+    @objc.python_method
+    def _reconcile(
+        self, layer, axes: list, key: tuple, previous, structure, undoable: bool
+    ) -> azsym_topology.Structure:
+        """Mirror a structural edit, ``previous`` to ``structure``, onto the
+        generated half, and store the binding re-derived for it. Returns the
+        structure as it now stands.
+
+        ``undoable`` while the designer's undo step for the edit is still open:
+        the mirror and the binding then join it, so one Cmd-Z takes both halves
+        back (``undoStepWillClose_``). Out of it they could not: Glyphs undoes a
+        node delete by putting the node back at its old INDEX (probed, Glyphs
+        4202), and a partner deleted out of the step had shifted every index
+        after it, so the node came back one place off and the next frame
+        mirrored it there (Hugo, 2026-10-22: "completly broken layer").
+        The step keeps the designer's name for it: the binding's write renames
+        it "Set UserData" (probed, Glyphs 4202), so the name is put back.
+        """
+        undo = layer.parent.undoManager() if undoable else None
+        name = undo.undoActionName() if undo is not None else ""
+        change = azsym_topology.classify(previous, structure)
+        if isinstance(layer, _ScopedLayer) and change.kind in (
+            azsym_topology.CONTOUR_ADDED,
+            azsym_topology.CONTOUR_REMOVED,
+        ):
+            # A path symmetry never adds or removes a contour: a deletion
+            # or one put back by Cmd-Z is re-paired, never mirrored.
+            change = azsym_topology.Change(kind=azsym_topology.UNCLASSIFIED)
+        if change.kind == azsym_topology.RENUMBERED:
+            # Keyed by the old numbering, even where the re-paired binding
+            # comes out the same as the stored one.
+            self._snapshots.pop(key, None)
+        reconciled = azsym_sync.reconcile(structure, previous, axes, change)
+        if _apply_structure(layer, reconciled.edits, undoable):
+            # The edits moved node indices. Everything past this point —
+            # the sync, the snapshot, the structure cached for the next
+            # frame — has to read the outline that now exists rather than
+            # the one this frame started with, or every mirrored position
+            # is written to the wrong node.
+            structure = _structure_of(layer)
+            # And nothing else will invalidate the view: the write went
+            # through the non-reporting update pair, so a node that has
+            # just appeared or gone stays wrong on screen until some
+            # unrelated event repaints. Only on the frame the edits landed,
+            # which is why _apply_structure reports whether they did.
+            _request_repaint()
+        if reconciled.axes != tuple(axes):
+            # In place, because tick hands this same list to _draw_axes
+            # once the sync returns: drawn from the superseded binding, a
+            # re-derived axis reports the wrong unpaired count.
+            axes[:] = list(reconciled.axes)
+            self._persist(layer, axes, undoable)
+            # The snapshot is keyed by node index and those indices have
+            # just moved. It is unusable on its own terms too: every pair
+            # touching an inserted node is absent from it, and the pair
+            # guard refuses anything it cannot see was symmetric last
+            # frame, so the axis would report stale whatever the outline
+            # looks like. Dropping it sends sync down its previous-is-None
+            # path, which writes nothing this frame and rebuilds the
+            # snapshot on the new indices. Mirroring resumes next frame.
+            self._snapshots.pop(key, None)
+        if undo is not None and name:
+            undo.setActionName_(name)
+        return structure
+
+    @objc.python_method
+    def _keep_connections_honest(self, layer, key: tuple, structure, actual: dict):
         """Make sharp the smooth nodes this frame's write kinked, and give back
         their connection to the ones whose handles line up again.
 
@@ -5355,7 +5515,7 @@ class AZSymmetry(GeneralPlugin):
         return structure
 
     @objc.python_method
-    def _persist(self, layer, axes: list) -> None:
+    def _persist(self, layer, axes: list, undoable: bool = False) -> None:
         """Write a re-derived binding back to the layer.
 
         ``reconcile`` hands back a pairing built for the outline it has just
@@ -5379,7 +5539,9 @@ class AZSymmetry(GeneralPlugin):
 
         The write goes through ``_out_of_undo``: this runs inside the draw
         callback, where an interface report or an undo step of its own would
-        both land on top of the user's edit.
+        both land on top of the user's edit. Unless ``undoable``: written while
+        the designer's undo step is still open, it joins that step instead
+        (``_reconcile``).
         """
         try:
             existing = _items_or_none(_read_userdata(layer, KEY))
@@ -5395,6 +5557,9 @@ class AZSymmetry(GeneralPlugin):
                 entry["binding"] = azsym_binding.to_dict(axis.binding)
                 entry["centre"] = [axis.centre[0], axis.centre[1]]
                 store[key] = entry
+            if undoable:
+                _write_userdata(layer, KEY, store)
+                return
             with _out_of_undo(layer):
                 _write_userdata(layer, KEY, store)
         except Exception:
@@ -5546,8 +5711,75 @@ class AZSymmetry(GeneralPlugin):
             # in _bind: it only describes the previous frame while a binding is
             # live, and nothing updates it while none is.
             self._structures.pop(key, None)
+            # Released, its nodes are the designer's: a corner kept is no
+            # longer one the sync made.
+            self._sharpened.pop(key, None)
         except Exception:
             print(traceback.format_exc())
+
+    @objc.python_method
+    def _swap_side(self, mode: str, layer=None) -> bool:
+        """Hand the designer the other half of ``mode``: the generated half
+        becomes the one drawn (Hugo, 2026-10-21, "swap symmetry side").
+
+        No node moves, because the generated half already mirrors the drawn one.
+        Only the store changes: the sign, and each pair's two ends, since a pair
+        names its drawn node first. One store write, so one Cmd-Z swaps back.
+        ``layer`` and the path symmetry its selection names, as ``_toggle``.
+        """
+        try:
+            if layer is None:
+                layer = _current_layer()
+            target = self._target_of(layer) if layer is not None else None
+            if target is None or isinstance(target, str):
+                return False
+            axis = next(
+                (
+                    axis
+                    for axis in self._axes_for_layer(target)
+                    if azsym_geometry.switch_of(axis.mode) == mode
+                ),
+                None,
+            )
+            if axis is None:
+                return False
+            _sign, reason = self._swap_states(target)[mode]
+            if reason:
+                print(f"[AZ Symmetrify] {MODE_TITLES.get(mode, mode)} not swapped. {reason}.")
+                return False
+            pairs = tuple(
+                (dst_path, dst_node, src_path, src_node)
+                for src_path, src_node, dst_path, dst_node in axis.binding.pairs
+            )
+            store = dict(_items(_read_userdata(target, KEY) or {}))
+            fields = dict(_items(store[mode]))
+            fields["sign"] = -axis.sign
+            fields["binding"] = azsym_binding.to_dict(replace(axis.binding, pairs=pairs))
+            store[mode] = fields
+            return _write_userdata(target, KEY, store)
+        except Exception:
+            print(traceback.format_exc())
+            return False
+
+    @objc.python_method
+    def _swap_states(self, layer) -> dict[str, tuple[int, str]]:
+        """Each symmetry bound on ``layer``: the side it has the designer draw,
+        and why it cannot swap, or "". A swap hands a broken one's generated
+        half the lead, so a symmetry that no longer mirrors, or leaves nodes
+        without a partner, keeps its side."""
+        axes = self._axes_for_layer(layer)
+        dormant, _moved = _dormant_modes(layer, axes)
+        states = {}
+        for axis in axes:
+            mode = azsym_geometry.switch_of(axis.mode)
+            if axis.binding.unpaired:
+                reason = SWAP_UNPAIRED
+            elif mode in dormant:
+                reason = SWAP_DORMANT
+            else:
+                reason = ""
+            states[mode] = (axis.sign, reason)
+        return states
 
     @objc.python_method
     def _bind(self, mode: str) -> None:
@@ -5695,7 +5927,7 @@ class AZSymmetry(GeneralPlugin):
             # so the click cannot be made. This stays as the enforcement for the
             # other way in — the scan window's Apply, which binds layers the
             # designer is not looking at and cannot grey anything out for.
-            for other in azsym_geometry.excluded_by(mode):
+            for other in azsym_geometry.excluded_by(mode, italic=bool(shear)):
                 if other in _bound_modes(layer):
                     self._release_layer(layer, other)
             return True
@@ -6019,7 +6251,7 @@ class AZSymmetry(GeneralPlugin):
                 back = [path for path in gone if id(path) in live]
                 if missing and len(paths) != count - len(missing) + len(back):
                     objects, gone = stored, []
-                    view_key = f"{key}\x00{entry['id']}"
+                    view_key = (*key, entry["id"])
                     for cache in (self._snapshots, self._structures, self._sharpened):
                         cache.pop(view_key, None)
                 else:
@@ -6203,7 +6435,7 @@ class AZSymmetry(GeneralPlugin):
     # ------------------------------------------------------------------ draw
 
     @objc.python_method
-    def _fill_generated(self, outline, axes: list, extent) -> None:
+    def _fill_generated(self, outline, axes: list, extent, color=None) -> None:
         """Shade every half of the glyph that a binding generates — ONCE.
 
         Clipped rather than reconstructed: a generated side is not a closed
@@ -6217,16 +6449,22 @@ class AZSymmetry(GeneralPlugin):
         darker than either half alone — reading as a third state that means
         nothing.
         """
-        _fill_generated_halves(outline, axes, extent)
+        _fill_generated_halves(outline, axes, extent, color)
 
     @objc.python_method
-    def _draw_axes(self, layer, axes: list, stale_axes, scale: float, points=None) -> None:
+    def _draw_axes(
+        self, layer, axes: list, stale_axes, scale: float, points=None, warned=()
+    ) -> None:
         """Draw each bound axis in the colour of its actual state.
 
         ``stale_axes`` comes from the sync that just ran, so an axis that has
         stopped mirroring — because a contour was reordered or a node count
         changed — is drawn red rather than being recomputed here from node
         counts alone, which cannot see the first case.
+
+        ``warned`` are the generated handles a selected node would strand
+        (``_stranded_points``): the wash and every healthy axis go orange, and
+        each handle gets an orange dot and ``STRANDED_SIGN`` over it.
         """
         # A stale axis is writing nothing, so shading a half of the glyph as
         # "generated" on its behalf would be a lie.
@@ -6238,7 +6476,8 @@ class AZSymmetry(GeneralPlugin):
             # on every frame of a drag. The box is the layer's as it stands,
             # which a half-turn's split runs corner to corner across.
             extent = azsym_geometry.extent_of(points, shaded[0].shear)
-            self._fill_generated(_outline_of(layer), shaded, extent)
+            wash = UNPAIRED_COLOR().colorWithAlphaComponent_(MIRRORED_FILL_ALPHA)
+            self._fill_generated(_outline_of(layer), shaded, extent, wash if warned else None)
 
         # Every axis is held to the same glyph, so its extent is read once.
         # Live rather than frozen at bind time: the axis POSITION must not
@@ -6254,6 +6493,7 @@ class AZSymmetry(GeneralPlugin):
         # A path symmetry's line shows only while its paths are selected, or
         # several on one glyph cross it with lines. A warning shows regardless.
         quiet = isinstance(layer, _ScopedLayer) and not _selection_by_path(layer)[1]
+        width = _span_width(layer)
         for index, axis in enumerate(axes):
             stale = index in stale_axes
             unpaired = len(axis.binding.unpaired)
@@ -6262,16 +6502,25 @@ class AZSymmetry(GeneralPlugin):
             label = azsym_sync.axis_label(stale, unpaired)
             if stale:
                 color = STALE_COLOR()
-            elif unpaired:
+            elif unpaired or warned:
                 color = UNPAIRED_COLOR()
             else:
                 color = BOUND_COLOR()
             color.set()
 
             origin = azsym_geometry.axis_origin(axis.centre, axis.shear)
-            _stroke_axis_line(points, axis.centre, axis.mode, axis.shear, scale, axis.split)
+            _stroke_axis_line(
+                points, axis.centre, axis.mode, axis.shear, scale, axis.split, width
+            )
             if label is not None:
                 _draw_text(label, origin, color, scale)
+        reach = STRANDED_DOT_RADIUS / scale
+        for point in warned:
+            UNPAIRED_COLOR().colorWithAlphaComponent_(STRANDED_DOT_ALPHA).set()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                ((point[0] - reach, point[1] - reach), (2 * reach, 2 * reach))
+            ).fill()
+            _draw_text(STRANDED_SIGN, point, UNPAIRED_COLOR(), scale, 14.0, (-9.0, 5.0))
 
 
 # ---------------------------------------------------------------- helpers
@@ -6376,7 +6625,7 @@ def _preview_axes(centre, shear: float, modes, signs, split=None) -> list:
 
 
 def _stroke_axis_line(
-    points, centre, mode: str, shear: float, scale: float, split=None
+    points, centre, mode: str, shear: float, scale: float, split=None, width=None
 ) -> None:
     """The dashed axis line, in whatever colour is already set.
 
@@ -6385,7 +6634,7 @@ def _stroke_axis_line(
     ghost's whole claim is that it shows what binding would do, and a line drawn
     a different way would undercut that.
     """
-    start, end = azsym_geometry.axis_span(points, centre, mode, shear, split)
+    start, end = azsym_geometry.axis_span(points, centre, mode, shear, split, width)
     path = NSBezierPath.bezierPath()
     path.setLineWidth_(AXIS_LINE_WIDTH / scale)
     # Divided by the zoom so the dash keeps its on-screen length instead of
@@ -6394,6 +6643,12 @@ def _stroke_axis_line(
     path.moveToPoint_(NSPoint(start[0], start[1]))
     path.lineToPoint_(NSPoint(end[0], end[1]))
     path.stroke()
+
+
+def _span_width(layer) -> float:
+    """The width ``axis_span`` runs a line across: the layer's advance, or 0 for
+    a path symmetry, whose line keeps to its own paths."""
+    return 0.0 if isinstance(layer, _ScopedLayer) else _advance_of(layer)
 
 
 def _draw_preview(layer, scale: float) -> None:
@@ -6453,7 +6708,7 @@ def _draw_preview(layer, scale: float) -> None:
     color.set()
     # The coordinates ``outline()`` already read, not a fresh walk of the layer.
     for mode in preview.modes:
-        _stroke_axis_line(points, centre, mode, shear, scale, preview.split)
+        _stroke_axis_line(points, centre, mode, shear, scale, preview.split, _span_width(layer))
 
 
 def _draw_split_only(layer, preview, scale: float) -> None:
@@ -6473,7 +6728,7 @@ def _draw_split_only(layer, preview, scale: float) -> None:
     )
     BOUND_COLOR().set()
     for mode in preview.modes:
-        _stroke_axis_line(points, centre, mode, shear, scale, preview.split)
+        _stroke_axis_line(points, centre, mode, shear, scale, preview.split, _span_width(layer))
 
 
 def _dim_replaced(layer, structure, axes: list, extent, scale: float) -> None:
@@ -6651,11 +6906,14 @@ def _preview_layer(layer, coords):
         return None
 
 
-def _draw_text(text: str, point: tuple, color, scale: float) -> None:
+def _draw_text(
+    text: str, point: tuple, color, scale: float, size: float = 11.0, offset=(6.0, 6.0)
+) -> None:
     """Draw a label at a design-space point, at a fixed on-screen size.
 
     The canvas is scaled by the zoom, so the transform undoes that around the
-    anchor point — otherwise the label would grow with the glyph.
+    anchor point — otherwise the label would grow with the glyph. ``offset`` is
+    in screen points from the anchor.
     """
     context = NSGraphicsContext.currentContext()
     if context is None:
@@ -6669,11 +6927,11 @@ def _draw_text(text: str, point: tuple, color, scale: float) -> None:
         transform.scaleBy_(1.0 / scale)
         transform.concat()
         attributes = {
-            NSFontAttributeName: NSFont.systemFontOfSize_(11.0),
+            NSFontAttributeName: NSFont.systemFontOfSize_(size),
             NSForegroundColorAttributeName: color,
         }
         NSAttributedString.alloc().initWithString_attributes_(text, attributes).drawAtPoint_(
-            NSPoint(6.0, 6.0)
+            NSPoint(*offset)
         )
     except Exception:
         _print_once(traceback.format_exc())
@@ -6804,7 +7062,7 @@ def _redraw_now(_timer=None) -> None:
         _print_once(traceback.format_exc())
 
 
-def _segment_enabled(mode: str, bound: set) -> bool:
+def _segment_enabled(mode: str, bound: set, italic: bool = False) -> bool:
     """Whether this segment may be clicked at all, given what is already on.
 
     Hugo, 2026-08-11: don't let rotate be used while a mirror is on, or a
@@ -6816,9 +7074,10 @@ def _segment_enabled(mode: str, bound: set) -> bool:
     Derived from the SAME function that performs the release, so the control
     cannot offer a click the bind path would then undo.
 
-    A bound segment is always enabled: nothing excludes itself, so the only way
-    out of a state stays available. Switching the half-turn off re-enables both
-    mirrors, and vice versa.
+    A bound segment is always enabled, so the only way out of a state stays
+    available: also on an italic layer bound to both mirrors before only one
+    was allowed there (``italic``, see ``excluded_by``). Switching the half-turn
+    off re-enables both mirrors, and vice versa.
 
     A COMPOUND segment is asked about each symmetry it stands for, so the pair
     greys out exactly when either mirror would: with the half-turn on. Decomposed
@@ -6827,10 +7086,12 @@ def _segment_enabled(mode: str, bound: set) -> bool:
     to split a name on a separator that lives in azsym_scan would tie the two
     pure modules together for one caller.
     """
+    if mode in bound:
+        return True
     return not any(
         other in bound
         for component in azsym_scan.combo_modes(mode)
-        for other in azsym_geometry.excluded_by(component)
+        for other in azsym_geometry.excluded_by(component, italic)
     )
 
 
@@ -7060,7 +7321,9 @@ def _axis_note(layer, mode: str, structure, sign: int) -> str:
     return f" — {', '.join(parts)}" if parts else ""
 
 
-def _segment_tooltip(mode: str, label: str, bound: set, impure: str = "") -> str:
+def _segment_tooltip(
+    mode: str, label: str, bound: set, impure: str = "", italic: bool = False
+) -> str:
     """What a segment says on hover, including why it cannot be clicked.
 
     A greyed control with no explanation reads as broken. Naming the symmetry
@@ -7074,8 +7337,8 @@ def _segment_tooltip(mode: str, label: str, bound: set, impure: str = "") -> str
         dict.fromkeys(
             other
             for component in azsym_scan.combo_modes(mode)
-            for other in azsym_geometry.excluded_by(component)
-            if other in bound
+            for other in azsym_geometry.excluded_by(component, italic)
+            if other in bound and mode not in bound
         )
     )
     if blocking:
@@ -7088,7 +7351,7 @@ def _segment_tooltip(mode: str, label: str, bound: set, impure: str = "") -> str
     return label
 
 
-def _segment_image(mode: str, label: str):
+def _segment_image(mode: str, label: str, side: str | None = None, enabled: bool = True):
     """One segment's icon, or None when the art cannot be loaded.
 
     None is what sends the caller to ``SEGMENT_FALLBACKS`` and its words. That
@@ -7100,11 +7363,50 @@ def _segment_image(mode: str, label: str):
     also the segment's tooltip. A bundled image has no name of its own the way
     a system symbol does, so it is set explicitly or VoiceOver reads the switch
     row as three unnamed buttons.
+
+    ``side`` puts the swap chip beside the icon, pointing at that half, faded
+    unless ``enabled`` (``_with_swap_chip``).
     """
-    image = _symmetry_icon(mode, SEGMENT_ICON_SIZE)
-    if image is not None:
-        with contextlib.suppress(Exception):
-            image.setAccessibilityDescription_(label)
+    icon = _symmetry_icon(mode, SEGMENT_ICON_SIZE)
+    if icon is None:
+        return None
+    image = icon if side is None else _with_swap_chip(icon, side, enabled)
+    with contextlib.suppress(Exception):
+        image.setAccessibilityDescription_(
+            label if side is None else f"{label}: you draw the {side}"
+        )
+    return image
+
+
+def _with_swap_chip(icon, side: str, enabled: bool):
+    """``icon`` and, ``SWAP_GAP`` to its right, the chip with its triangle
+    pointing at ``side``: one template, for the switch to centre and ink. Drawn
+    rather than typed, because ◀ and ▶ have emoji forms."""
+    left = SEGMENT_ICON_SIZE + SWAP_GAP
+    margin = (TRIANGLE_HIT - TRIANGLE_SIZE) / 2.0
+    corners = [NSPoint(left + margin + x, margin + y) for x, y in TRIANGLES[side]]
+    share = 1.0 if enabled else TRIANGLE_DIMMED
+
+    def draw(_rect) -> bool:
+        icon.drawInRect_(((0.0, 0.0), (SEGMENT_ICON_SIZE, SEGMENT_ICON_SIZE)))
+        chip = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            ((left, 0.0), (TRIANGLE_HIT, TRIANGLE_HIT)), TRIANGLE_CHIP_RADIUS, TRIANGLE_CHIP_RADIUS
+        )
+        NSColor.colorWithWhite_alpha_(0.0, TRIANGLE_CHIP_ALPHA * share).set()
+        chip.fill()
+        path = NSBezierPath.bezierPath()
+        path.moveToPoint_(corners[0])
+        for corner in corners[1:]:
+            path.lineToPoint_(corner)
+        path.closePath()
+        NSColor.colorWithWhite_alpha_(0.0, share).set()
+        path.fill()
+        return True
+
+    image = NSImage.imageWithSize_flipped_drawingHandler_(
+        (SWAP_GROUP, SEGMENT_ICON_SIZE), False, draw
+    )
+    image.setTemplate_(True)
     return image
 
 
@@ -7566,17 +7868,21 @@ def _dormant_bindings(font) -> list[tuple[str, str, tuple[str, ...]]]:
     return dormant
 
 
-def _dormant_modes(layer) -> tuple[tuple[str, ...], tuple[tuple[str, tuple[float, float]], ...]]:
+def _dormant_modes(
+    layer, axes: list | None = None
+) -> tuple[tuple[str, ...], tuple[tuple[str, tuple[float, float]], ...]]:
     """Sort this layer's bound symmetries into the broken and the merely moved.
 
     Returns ``(dormant modes, [(mode, where its axis should be)])``. The second
     list is the SAFE half of the question — the symmetries re-applying would not
     move a single node — and the caller repairs those instead of reporting them.
+    ``axes`` when the caller has read them already.
     """
     if not _bound_modes(layer):
         return (), ()
     try:
-        axes = _PLUGIN._axes_for_layer(layer) if _PLUGIN is not None else []
+        if axes is None:
+            axes = _PLUGIN._axes_for_layer(layer) if _PLUGIN is not None else []
         if not axes:
             return (), ()
         paths = _paths_of(layer)
@@ -7671,7 +7977,10 @@ def _typed_angle(layer) -> float | None:
         split = _stored_split(layer, azsym_geometry.ROTATE)
         if split is None:
             return None
-        return azsym_geometry.split_angle(split, _stored_shear(layer, azsym_geometry.ROTATE))
+        # To the nanodegree: read back, 45° comes out as 44.99999999999999,
+        # across the 45° rule (``guide_stands``) that chose which side is which.
+        angle = azsym_geometry.split_angle(split, _stored_shear(layer, azsym_geometry.ROTATE))
+        return round(angle, 9)
     return _pending_angle(layer)
 
 
@@ -7692,7 +8001,12 @@ def _resplit(layer, split: tuple[float, float] | None) -> bool:
     left clear stayed read-only (final review, 2026-10-15). So the pairing is
     re-derived about the stored centre and sign with the new split, exactly as
     the bind derived it, and stored with it. Written the way ``_recentre``
-    writes a centre: userData only, the layer's caches dropped, not an undo step.
+    writes a centre: userData only, the layer's caches dropped, and through
+    ``_out_of_undo``, since Glyphs makes every userData write an undo step: each
+    arrow press in the field was one (Hugo, 2026-10-22: "every steps are store
+    in undo manager, this is anoying"). Out of undo, nothing calls the glyph's
+    ``updateChangeCount:`` (GSUndoManager.h) either, so it is called here: the
+    document still asks to save the new angle.
     """
     try:
         store = dict(_items(_read_userdata(layer, KEY) or {}))
@@ -7724,12 +8038,15 @@ def _resplit(layer, split: tuple[float, float] | None) -> bool:
         else:
             fields["split"] = [split[0], split[1]]
         store[azsym_geometry.ROTATE] = fields
-        if not _write_userdata(layer, KEY, store):
+        with _out_of_undo(layer):
+            written = _write_userdata(layer, KEY, store)
+        if not written:
             return False
         if _PLUGIN is not None:
             key = _snapshot_key(layer)
             _PLUGIN._snapshots.pop(key, None)
             _PLUGIN._structures.pop(key, None)
+        layer.parent.updateChangeCount_(NS_CHANGE_DONE)
         return True
     except Exception:
         print(traceback.format_exc())
@@ -7756,8 +8073,9 @@ def _enter_diagonal(layer, text: str) -> None:
 def _commit_diagonal(layer, text: str) -> str:
     """Take what was typed in the Diagonal field; return what it should show.
 
-    Empty is Auto. A number is taken modulo 180 and kept to one decimal, with a
-    comma read as the point and a trailing ° ignored. Anything else changes
+    Empty is Auto. A number is taken in whole degrees modulo 180
+    (``_whole_degrees``), with a comma read as the point and a trailing °
+    ignored. Anything else changes
     nothing, and the field goes back to what it showed. On a glyph whose Rotate
     180° is on, the angle re-splits that binding (``_resplit``); otherwise it
     waits in ``_PENDING_ANGLES`` for the glyph's next bind.
@@ -7767,11 +8085,13 @@ def _commit_diagonal(layer, text: str) -> str:
     if not readable:
         return _diagonal_text(layer)
     if azsym_geometry.ROTATE in _bound_modes(layer):
-        shear = _stored_shear(layer, azsym_geometry.ROTATE)
-        split = None if angle is None else azsym_geometry.axis_split(angle, shear)
         # The field commits whenever focus leaves it: clicking in and out again
-        # must not rewrite the binding (final review, 2026-10-15).
-        if not _same_split(split, _stored_split(layer, azsym_geometry.ROTATE)):
+        # must not rewrite the binding (final review, 2026-10-15). Compared as
+        # shown, so an angle bound before whole degrees, 57.5 shown as 58, is
+        # not moved to what it shows (review, 2026-10-22).
+        if ("" if angle is None else _angle_text(angle)) != _diagonal_text(layer):
+            shear = _stored_shear(layer, azsym_geometry.ROTATE)
+            split = None if angle is None else azsym_geometry.axis_split(angle, shear)
             _resplit(layer, split)
     elif angle is None:
         _PENDING_ANGLES.pop(_glyph_key(layer), None)
@@ -7780,10 +8100,11 @@ def _commit_diagonal(layer, text: str) -> str:
     return _diagonal_text(layer)
 
 
-def _read_angle(text: str) -> tuple[bool, float | None]:
+def _read_angle(text: str) -> tuple[bool, int | None]:
     """(readable, angle) for text in the Diagonal field: empty is Auto (None),
-    a number is taken modulo 180 to one decimal, with a comma read as the point
-    and a trailing ° ignored. Anything else is unreadable."""
+    a number is taken in whole degrees modulo 180 (``_whole_degrees``), with a
+    comma read as the point and a trailing ° ignored. Anything else is
+    unreadable."""
     cleaned = text.strip().replace(",", ".").rstrip("°").strip()
     if not cleaned:
         return True, None
@@ -7793,7 +8114,13 @@ def _read_angle(text: str) -> tuple[bool, float | None]:
         return False, None
     if not math.isfinite(value):
         return False, None
-    return True, round(value % 180.0, 1) % 180.0
+    return True, _whole_degrees(value)
+
+
+def _whole_degrees(angle: float) -> int:
+    """``angle`` in whole degrees modulo 180, half up (Hugo, 2026-10-22: "always
+    round to int, don't use float"). Not ``round``, which takes 2.5 to 2."""
+    return math.floor(angle + 0.5) % 180
 
 
 def _auto_angle(layer) -> float | None:
@@ -7822,12 +8149,6 @@ def _step_diagonal(layer, text: str, step: float) -> str:
         return _diagonal_text(layer)
     return _commit_diagonal(layer, _angle_text((angle + step) % 180.0))
 
-
-def _same_split(first: tuple[float, float] | None, second: tuple[float, float] | None) -> bool:
-    """Whether two stored splits name the same line: both Auto, or equal."""
-    if first is None or second is None:
-        return first is second
-    return all(math.isclose(a, b, abs_tol=1e-12) for a, b in zip(first, second, strict=True))
 
 
 def _outline_of(layer):
@@ -7915,6 +8236,43 @@ def _selected_nodes(layer) -> list:
     except Exception:
         return []
     return chosen
+
+
+def _selected_points(layer) -> set:
+    """Positions of the selected path nodes, read off ``layer.selection`` once.
+
+    Per frame, unlike ``_selected_nodes``: GlyphsApp's ``node.selected`` asks
+    ``node in layer.selection``, which walks the selection for every node.
+    Anything selected that is not a node (an anchor, a component, a guide) has
+    no node type and is passed over.
+    """
+    chosen: set = set()
+    try:
+        for item in layer.selection or ():
+            if str(getattr(item, "type", "")) in NODE_TYPES:
+                point = _read(item, _NODE_POSITION, "position")
+                chosen.add((point.x, point.y))
+    except Exception:
+        return set()
+    return chosen
+
+
+def _stranded_points(layer, axes: list, stale_axes) -> list:
+    """Where the generated handles a selected node would strand sit
+    (``azsym_sync.stranded_handles``), for every axis still mirroring."""
+    selected = _selected_points(layer)
+    if not selected:
+        return []
+    structure = _structure_of(layer)
+    points = []
+    for index, axis in enumerate(axes):
+        if index in stale_axes:
+            continue
+        for path, node in azsym_sync.stranded_handles(axis, structure, selected):
+            point = structure.paths[path][node]
+            if point not in points:
+                points.append(point)
+    return points
 
 
 def _selected_guides(layer) -> list:
@@ -8170,9 +8528,9 @@ def _split_standing(layer, mode: str) -> bool | None:
 
 
 def _angle_text(angle: float) -> str:
-    """An angle as the Diagonal field and the tooltip show it: modulo 180, at
-    most one decimal, no trailing zero."""
-    return f"{round(angle, 1) % 180.0:g}"
+    """An angle as the Diagonal field and the tooltip show it: whole degrees,
+    modulo 180."""
+    return str(_whole_degrees(angle))
 
 
 def _point_of(value) -> tuple | None:
@@ -8184,29 +8542,23 @@ def _point_of(value) -> tuple | None:
     return (x, y)
 
 
-def _snapshot_key(layer) -> str:
-    """Cache key unique to this glyph's copy of this layer.
+def _snapshot_key(layer) -> tuple:
+    """Cache key unique to this glyph's copy of this layer: the glyph OBJECT and
+    the layer's id.
 
-    ``layer.layerId`` for a master layer is the font MASTER's id, so it is
-    identical across every glyph built on that master — glyph B's layer would
-    read glyph A's snapshot and see every differing node as user-moved. The
-    glyph name has to be folded in to tell them apart.
-
-    The name is also what makes the key fragile, and deliberately so. RENAMING a
-    glyph gives its layers a key nothing has ever written, so the structure
-    baseline is absent for one frame; sync takes its previous-is-None path,
-    writes nothing, and rebuilds on the new key, which is the same recovery the
-    reconcile path already relies on. The entry left behind under the old name
-    is unreachable, and is collected by ``documentClosed`` along with the rest.
-
-    No font is folded in because there is nothing stable to fold: two open files
-    can hold the same glyph on the same master id, so the key is not unique
-    across documents. That is why the caches are cleared wholesale on a close
-    rather than filtered by font — see ``documentClosed``.
+    ``layer.layerId`` for a master layer is the font MASTER's id, identical
+    across every glyph on that master, so the glyph has to tell them apart. The
+    glyph itself, not its name: two open copies of a file hold the same name on
+    the same master id, and so does an alternate renamed to the name of a glyph
+    just deleted. Each read the other's last frame as its own and rewrote its
+    outline and axis from it, out of undo (edge-case hunt, 2026-10-22). GSGlyph
+    compares and hashes by identity (GlyphsCore 3532 and 4202 override neither
+    isEqual: nor hash), as the font in ``_glyph_key`` does. A renamed glyph
+    keeps its key, and its caches.
     """
-    key = f"{layer.parent.name}\x00{layer.layerId}"
+    key = (layer.parent, str(layer.layerId))
     if isinstance(layer, _ScopedLayer):
-        key += f"\x00{layer.scope_key}"
+        key += (layer.scope_key,)
     return key
 
 
@@ -8733,7 +9085,30 @@ def _new_contour(edit: azsym_sync.StructuralEdit) -> GSPath:
     return path
 
 
-def _apply_structure(layer, edits: tuple[azsym_sync.StructuralEdit, ...]) -> bool:
+def _open_step(layer) -> bool:
+    """Whether the designer's undo step for the edit in hand is still open on
+    ``layer``'s glyph, so an edit made now joins it (``AZSymmetry._reconcile``)."""
+    undo = layer.parent.undoManager()
+    return (
+        undo is not None
+        and undo.groupingLevel() > 0
+        and not undo.isUndoing()
+        and not undo.isRedoing()
+    )
+
+
+def _glyph_of_undo(manager):
+    """The glyph a GSUndoManager keeps the steps of; None for any other undo
+    manager, a text field's or a window's, which has no ``glyph``."""
+    try:
+        return manager.glyph()
+    except Exception:
+        return None
+
+
+def _apply_structure(
+    layer, edits: tuple[azsym_sync.StructuralEdit, ...], undoable: bool = False
+) -> bool:
     """Apply ``reconcile()``'s structural edits to the real outline.
 
     Mirrors ``azsym_sync._with_edits`` exactly: the edits are applied
@@ -8768,16 +9143,21 @@ def _apply_structure(layer, edits: tuple[azsym_sync.StructuralEdit, ...]) -> boo
     mid-write exception cannot skip ``enableFutureUpdates`` and leave the
     counter sunk.
 
-    Undo registration is off, through the same two calls ``_apply`` uses and
-    for a reason measured in Glyphs 4.0.1. Leaving it on does NOT enrol these
-    edits in the user's own undo record: it pushes a SECOND, later entry. The
-    first Cmd-Z then popped the plugin's edit — restoring the partner node
-    while the user's own node stayed deleted — and since that partner sits on
-    the generated half, the next tick removed it again, so the undo appeared to
-    do nothing at all. With registration off there is one entry, the user's:
-    Cmd-Z brings their node back, the next tick classifies it as INSERTED, and
-    the mirror puts the partner back. One step, both halves, down a healing
-    path that already exists.
+    Undo registration is off, through the same two calls ``_apply`` uses, once
+    the designer's step has closed, for a reason measured in Glyphs 4.0.1.
+    Leaving it on then does NOT enrol these edits in the user's own undo
+    record: it pushes a SECOND, later entry. The first Cmd-Z then popped the
+    plugin's edit — restoring the partner node while the user's own node stayed
+    deleted — and since that partner sits on the generated half, the next tick
+    removed it again, so the undo appeared to do nothing at all. With
+    registration off, Cmd-Z brings the user's node back and the next tick
+    mirrors it again. That holds for an insert, but not for a delete: Glyphs
+    puts a deleted node back by INDEX (probed, Glyphs 4202), and a partner
+    removed before it on the path has shifted the indices.
+
+    ``undoable`` while the designer's undo step is still open
+    (``AZSymmetry._reconcile``): registration stays on and the edits join that
+    step, which is the only way Cmd-Z can put a deleted node back where it was.
 
     The manager is allowed to be nil, exactly as in ``_apply``:
     ``GSGlyph.undoManager`` is declared nullable in both Glyphs 3 and 4. The
@@ -8792,7 +9172,7 @@ def _apply_structure(layer, edits: tuple[azsym_sync.StructuralEdit, ...]) -> boo
     changed = False
     font.stopUpdateInterface()
     try:
-        if undo is not None:
+        if undo is not None and not undoable:
             undo.disableUndoRegistration()
         try:
             for edit in edits:
@@ -8828,7 +9208,7 @@ def _apply_structure(layer, edits: tuple[azsym_sync.StructuralEdit, ...]) -> boo
                         _apply_type(nodes[edit.index], edit.node_type)
                         changed = True
         finally:
-            if undo is not None:
+            if undo is not None and not undoable:
                 undo.enableUndoRegistration()
     finally:
         font.enableFutureUpdates()
@@ -9348,6 +9728,38 @@ def _build_switches(frame):
     return control
 
 
+class AZSymmetryPassThroughView(NSView):
+    """A view that takes no click of its own: one that misses its buttons goes
+    to whatever lies underneath, here the switch row."""
+
+    def hitTest_(self, point) -> Any:  # noqa: N802 - AppKit selector
+        hit = objc.super(AZSymmetryPassThroughView, self).hitTest_(point)
+        return None if hit is self else hit
+
+
+def _build_triangles(owner, frame) -> tuple:
+    """A transparent swap button over the right half of each switch, wired to
+    ``owner``, laid over the switch row at ``frame``. Its margins and width all
+    stretch, so a resize keeps it on that half."""
+    row = AZSymmetryPassThroughView.alloc().initWithFrame_(frame)
+    row.setAutoresizingMask_(WIDTH_SIZABLE)
+    _origin, (width, height) = frame
+    third = width / len(SEGMENT_ITEMS)
+    buttons = []
+    for index in range(len(SEGMENT_ITEMS)):
+        half = (((index + 0.5) * third, 0.0), (third / 2.0, height))
+        button = NSButton.alloc().initWithFrame_(half)
+        button.setAutoresizingMask_(THIRD_RESIZING)
+        button.setTransparent_(True)
+        button.setHidden_(True)
+        button.setTag_(index)
+        button.setTarget_(owner)
+        button.setAction_("triangleClicked:")
+        row.addSubview_(button)
+        buttons.append(button)
+    return row, buttons
+
+
 def _build_diagonal(owner) -> tuple:
     """The Diagonal row — caption, angle field, degree sign — wired to ``owner``.
 
@@ -9489,6 +9901,8 @@ def _sync_switches(control, plugin_instance, layer) -> list[bool]:
     )
     specs = plugin_instance._item_specs(layer, signs)
     held = {mode for _label, is_bound, mode in specs if is_bound}
+    # One symmetry at a time on an italic master (``excluded_by``).
+    italic = bool(_shear_of(layer))
     lit = []
     for index, (label, bound, mode) in enumerate(specs):
         control.setSelected_forSegment_(bound, index)
@@ -9497,7 +9911,7 @@ def _sync_switches(control, plugin_instance, layer) -> list[bool]:
         # _segment_enabled. Disabling is how the designer finds that out BEFORE
         # clicking rather than by watching two switches go off. Likewise when
         # it cannot give a pure symmetry (``_impure``).
-        enabled = _segment_enabled(mode, held)
+        enabled = _segment_enabled(mode, held, italic)
         impure = (
             _impure(plugin_instance, layer, mode, structure, signs[mode])
             if enabled and not bound
@@ -9515,9 +9929,54 @@ def _sync_switches(control, plugin_instance, layer) -> list[bool]:
         if scoped:
             label += " on these paths"
         control.setToolTip_forSegment_(
-            _segment_tooltip(mode, label + note, held, impure), index
+            _segment_tooltip(mode, label + note, held, impure, italic), index
         )
     return lit
+
+
+def _sync_triangles(buttons, plugin_instance, layer) -> list[tuple[str, bool] | None]:
+    """In each lit switch, a swap button over a chip pointing at the half its
+    symmetry has the designer draw (``triangleClicked_``). None in an unlit one,
+    or in a row ``_sync_switches`` greys. Faded, with the reason, in one that
+    cannot swap (``_swap_states``), its button still enabled: a disabled one
+    lets the click through to the switch underneath, which switched the
+    symmetry off (real AppKit, 2026-10-22), so ``_swap_side`` refuses it
+    instead. Hands back each switch's chip as ``(side, enabled)``, or None,
+    for its icon to draw."""
+    target = None
+    states = {}
+    if (
+        plugin_instance is not None
+        and layer is not None
+        and azsym_native.ERROR is None
+        and not _has_no_outline(layer)
+    ):
+        target = plugin_instance._target_of(layer)
+        if isinstance(target, str):
+            target = None
+        else:
+            states = plugin_instance._swap_states(target)
+    chips: list[tuple[str, bool] | None] = []
+    for button, (mode, _title) in zip(buttons, SEGMENT_ITEMS, strict=True):
+        state = states.get(mode)
+        button.setHidden_(state is None)
+        if state is None:
+            chips.append(None)
+            continue
+        sign, reason = state
+        drawn, written = _side_names(target, mode, sign)
+        button.setToolTip_(reason or f"You draw the {drawn}. Click to draw the {written}")
+        chips.append((drawn, not reason))
+    return chips
+
+
+def _side_names(layer, mode: str, sign: int) -> tuple[str, str]:
+    """(the half bound ``mode`` has the designer draw, the half it generates).
+    A half-turn about a typed angle names its halves by that line."""
+    angle = _typed_angle(layer) if mode == azsym_geometry.ROTATE else None
+    standing = None if angle is None else azsym_geometry.guide_stands(angle)
+    positive, negative = azsym_geometry.side_labels(mode, standing)
+    return (positive, negative) if sign > 0 else (negative, positive)
 
 
 def _clicked_segment(control, drawn: list) -> int:
@@ -9622,12 +10081,9 @@ class AZSymmetryPalette(PalettePlugin):
         above = PALETTE_MARGIN_BOTTOM + DIAGONAL_ROW_HEIGHT + PALETTE_ROW_GAP
         height = above + SEGMENT_HEIGHT + PALETTE_MARGIN_TOP
         self.dialog = NSView.alloc().initWithFrame_(((0.0, 0.0), (PALETTE_WIDTH, height)))
-        self._switches = _build_switches(
-            (
-                (PALETTE_MARGIN_X, above),
-                (PALETTE_WIDTH - PALETTE_MARGIN_X * 2.0, SEGMENT_HEIGHT),
-            )
-        )
+        row = ((PALETTE_MARGIN_X, above), (PALETTE_WIDTH - PALETTE_MARGIN_X * 2.0, SEGMENT_HEIGHT))
+        self._switches = _build_switches(row)
+        self._triangle_row, self._triangles = _build_triangles(self, row)
         label, self._diagonal, degree = _build_diagonal(self)
         # The layer the field was last filled for — see ``_fill_diagonal``.
         self._diagonal_layer = None
@@ -9639,7 +10095,11 @@ class AZSymmetryPalette(PalettePlugin):
         self._switches.setAction_("segmentToggled:")
         # What the row last showed, per segment — see ``_clicked_segment``.
         self._drawn = [False] * len(SEGMENT_ITEMS)
+        # The chip each switch's icon was last drawn with — see ``_refresh_triangles``.
+        self._chips = [None] * len(SEGMENT_ITEMS)
         self.dialog.addSubview_(self._switches)
+        # After the switches, so the triangles are drawn over them.
+        self.dialog.addSubview_(self._triangle_row)
         _track_hover(self._switches, self)
         # Registered here and not in start(): a SECONDARY class in a multi-class
         # bundle is not reliably sent start(), while settings() always runs when
@@ -9699,12 +10159,26 @@ class AZSymmetryPalette(PalettePlugin):
         try:
             layer = self._switch_layer()
             self._drawn = _sync_switches(self._switches, _PLUGIN, layer)
+            self._refresh_triangles(_PLUGIN, layer)
             _fill_diagonal(self._diagonal, layer, self._diagonal_layer)
             self._diagonal_layer = layer
         except Exception:
             # Throttled: this runs on every interface update, and a fault that
             # repeats should cost one traceback, not a console full of them.
             _print_once(traceback.format_exc())
+
+    @objc.python_method
+    def _refresh_triangles(self, plugin_instance, layer) -> None:
+        """The swap buttons, and each switch's icon with its chip or without:
+        redrawn only when that changes, since this runs on every update."""
+        chips = _sync_triangles(self._triangles, plugin_instance, layer)
+        for index, (mode, title) in enumerate(SEGMENT_ITEMS):
+            if chips[index] != self._chips[index]:
+                side, enabled = chips[index] or (None, True)
+                image = _segment_image(mode, title, side, enabled)
+                if image is not None:
+                    self._switches.setImage_forSegment_(image, index)
+        self._chips = chips
 
     def undoChanged_(self, notification) -> None:
         """Cmd-Z or Cmd-Shift-Z, anywhere: the row reads the layer again."""
@@ -9726,6 +10200,23 @@ class AZSymmetryPalette(PalettePlugin):
             # could not be read: the control has flipped a segment on its own,
             # and leaving it flipped would show a state the layer has not got.
             self._drawn = _sync_switches(sender, plugin_instance, layer)
+            self._refresh_triangles(plugin_instance, layer)
+        except Exception:
+            print(traceback.format_exc())
+
+    def triangleClicked_(self, sender) -> None:
+        """A switch's triangle was clicked: swap the half its symmetry has you draw."""
+        try:
+            plugin_instance = _PLUGIN
+            if plugin_instance is None:
+                return
+            layer = self._switch_layer()
+            index = int(sender.tag())
+            if layer is not None and 0 <= index < len(SEGMENT_ITEMS):
+                plugin_instance._swap_side(SEGMENT_ITEMS[index][0], layer)
+                # The wash moves and no node does, so nothing else repaints it.
+                plugin_instance._refresh()
+            self._refresh_triangles(plugin_instance, layer)
         except Exception:
             print(traceback.format_exc())
 
@@ -9749,6 +10240,8 @@ class AZSymmetryPalette(PalettePlugin):
             _clear_field_preview()
             _drop_hover_ghost()
             self._drawn = _sync_switches(self._switches, _PLUGIN, layer)
+            # A re-split can turn a half-turn's triangle.
+            self._refresh_triangles(_PLUGIN, layer)
             if _PLUGIN is not None:
                 # A re-split changes the wash and the dashed line, not a node,
                 # so nothing else would repaint them.
@@ -9797,6 +10290,8 @@ class AZSymmetryPalette(PalettePlugin):
                 _replace_typed(text_view, shown)
                 _show_field_preview(layer, _read_angle(shown)[1])
             self._drawn = _sync_switches(self._switches, _PLUGIN, layer)
+            # A step re-splits at once, which can turn the half-turn's chip.
+            self._refresh_triangles(_PLUGIN, layer)
             return True
         except Exception:
             print(traceback.format_exc())

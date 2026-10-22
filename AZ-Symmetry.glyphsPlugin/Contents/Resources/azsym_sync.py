@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, replace
 from azsym_binding import Binding, NodeRef, Pair, Paths, pair_nodes, stale_paths
 from azsym_geometry import (
     HORIZONTAL,
+    ROTATE,
     TOL,
     VERTICAL,
     Point,
@@ -37,6 +38,7 @@ from azsym_topology import (
     CURVE_JOIN,
     CURVE_SPLIT,
     DELETED,
+    DELETED_SEVERAL,
     HANDLE_PAIR,
     INSERTED,
     OFFCURVE,
@@ -425,6 +427,50 @@ def _choose_source(
     if second_derived and not first_derived:
         return second
     return None
+
+
+def stranded_handles(axis: Axis, structure: Structure, selected: set[Point]) -> list[NodeRef]:
+    """Generated handles a selected node drags along but cannot move.
+
+    Hugo, 2026-10-22, on an O bound as a half-turn split at a typed angle: "if I
+    move the node, the top handle will stay in place". Glyphs drags a node's
+    handles with it, and a generated handle is rewritten from its source on the
+    next frame. When that source is neither the node nor its other handle, it
+    stays put, so the handle springs back and the curve kinks. A node on a
+    mirror's axis is fine: its far handle's source is its near one.
+
+    ``selected`` holds positions; a selected node that is itself generated
+    springs back whole and is not asked about.
+    """
+    if not selected:
+        return []
+    source_of = {
+        (dst_path, dst_node): (src_path, src_node)
+        for src_path, src_node, dst_path, dst_node in axis.binding.pairs
+    }
+    stranded: list[NodeRef] = []
+    for path_index, (points, types) in enumerate(
+        zip(structure.paths, structure.types, strict=True)
+    ):
+        count = len(points)
+        for index, point in enumerate(points):
+            node = (path_index, index)
+            if types[index] == OFFCURVE or point not in selected or node in source_of:
+                continue
+            handles = [
+                (path_index, neighbour)
+                for neighbour in ((index - 1) % count, (index + 1) % count)
+                if types[neighbour] == OFFCURVE
+            ]
+            moving = {node, *handles}
+            stranded.extend(
+                handle
+                for handle in handles
+                if handle in source_of
+                and source_of[handle] not in moving
+                and handle not in stranded
+            )
+    return stranded
 
 
 def axis_label(stale: bool, unpaired: int) -> str | None:
@@ -1161,21 +1207,41 @@ def _mirror_join(
     return tuple(edits)
 
 
-def _mirror_delete(axis: Axis, change: Change) -> StructuralEdit | None:
-    """Which node to delete to match one the user removed, in CURRENT indices.
+def _mirror_deletes(
+    axes: list[Axis], previous: Structure, change: Change
+) -> tuple[StructuralEdit, ...]:
+    """The nodes to delete to match those the designer removed: their partners
+    under every axis, and those partners' in turn, so with both mirrors on a
+    node takes its two images and the one diagonally opposite. In CURRENT
+    indices, highest first, so no delete moves one still to come.
 
     Pairs only: an on-axis node is its own image, and reading that as "delete
-    the partner" would delete whatever has since slid into the freed index.
+    the partner" would delete whatever has since slid into the freed index. An
+    axis that no longer describes even the PREVIOUS outline names nodes that
+    moved long ago, and is left out.
     """
-    opposite = _partner_of(axis.binding, (change.path, change.index))
-    if opposite is None:
-        return None
-    index = opposite[1]
-    # The user's delete already happened, so anything after it on the SAME
-    # contour has moved down by one.
-    if opposite[0] == change.path and index > change.index:
-        index -= 1
-    return StructuralEdit(kind=DELETE_NODE, path=opposite[0], index=index)
+    removed = set(change.removed) or {(change.path, change.index)}
+    gone = set(removed)
+    live = [axis for axis in axes if not axis_is_stale(axis, previous.paths)]
+    grew = True
+    while grew:
+        grew = False
+        for axis in live:
+            for ref in list(gone):
+                opposite = _partner_of(axis.binding, ref)
+                if opposite is not None and opposite not in gone:
+                    gone.add(opposite)
+                    grew = True
+    return tuple(
+        # The designer's deletes already happened: anything after one on the
+        # same contour has moved down by one.
+        StructuralEdit(
+            kind=DELETE_NODE,
+            path=path,
+            index=index - sum(1 for at, node in removed if at == path and node < index),
+        )
+        for path, index in sorted(gone - removed, reverse=True)
+    )
 
 
 def _mirror_type_changed(
@@ -1413,6 +1479,11 @@ def _addressable(previous: Structure, structure: Structure, change: Change) -> b
         return 0 <= change.path < len(structure.paths)
     if change.kind == CONTOUR_REMOVED:
         return 0 <= change.path < len(previous.paths)
+    if change.kind == DELETED_SEVERAL:
+        return all(
+            0 <= path < len(previous.paths) and 0 <= index < len(previous.paths[path])
+            for path, index in change.removed
+        )
     if not 0 <= change.path < min(len(previous.paths), len(structure.paths)):
         return False
     if change.kind in (INSERTED, CURVE_SPLIT, SEGMENT_CURVED):
@@ -1425,6 +1496,7 @@ def _addressable(previous: Structure, structure: Structure, change: Change) -> b
 MIRRORED_KINDS = (
     INSERTED,
     DELETED,
+    DELETED_SEVERAL,
     CURVE_SPLIT,
     CURVE_JOIN,
     CONTOUR_ADDED,
@@ -1461,8 +1533,6 @@ def _mirrored(
         edit = _mirror_contour_removed(axis, previous, structure, change)
     elif change.kind == INSERTED:
         edit = _mirror_insert(axis, previous, structure, change)
-    elif change.kind == DELETED:
-        edit = _mirror_delete(axis, change)
     elif change.kind == TYPE_CHANGED:
         edit = _mirror_type_changed(axis, previous, structure, change)
     else:
@@ -1470,6 +1540,166 @@ def _mirrored(
         # _with_edits follows, for the same reason.
         return ()
     return () if edit is None else (edit,)
+
+
+def _composed(first: Axis, second: Axis) -> Axis | None:
+    """The half-turn two upright mirrors compose to, its pairing read through
+    both, or None for any other two. A node's image in the fourth quarter is
+    its partner's partner."""
+    if {first.mode, second.mode} != {VERTICAL, HORIZONTAL} or first.shear or second.shear:
+        return None
+    vertical, horizontal = (first, second) if first.mode == VERTICAL else (second, first)
+    refs = {
+        (path, node) for pair in horizontal.binding.pairs for path, node in (pair[:2], pair[2:])
+    }
+    refs.update(horizontal.binding.onaxis)
+    pairs: list[Pair] = []
+    onaxis: list[NodeRef] = []
+    for ref in sorted(refs):
+        across = _image_of(horizontal.binding, ref)
+        image = _image_of(vertical.binding, across) if across is not None else None
+        if image == ref:
+            onaxis.append(ref)
+        elif image is not None and ref < image:
+            pairs.append((*ref, *image))
+    binding = Binding(
+        pairs=tuple(pairs), onaxis=tuple(onaxis), counts=vertical.binding.counts, unpaired=()
+    )
+    centre = (vertical.centre[0], horizontal.centre[1])
+    return Axis(binding=binding, centre=centre, mode=ROTATE, sign=vertical.sign)
+
+
+def _merged(
+    paths: Paths, groups: list[tuple[StructuralEdit, ...]]
+) -> tuple[StructuralEdit, ...] | None:
+    """Edit tuples each written against ``paths`` alone, as one tuple in the
+    ReconcileResult order, or None where they collide: two put nodes into one
+    gap, or set one node two ways.
+
+    Each tuple is replayed on its own copy, existing nodes named by their index
+    in ``paths`` and new ones by identity, so a new run is known by the
+    existing node it follows. The runs then go in after their nodes, the moves
+    and retypes are made, and the deletes, last and highest first. Whole
+    contours come after: those removed, highest first, then those appended.
+    """
+    runs: dict[NodeRef, list[list]] = {}
+    removed_contours: set[int] = set()
+    added_contours: list[StructuralEdit] = []
+    moves: dict[NodeRef, Point] = {}
+    retypes: dict[NodeRef, str] = {}
+    deletes: set[NodeRef] = set()
+    for group in groups:
+        lists: list[list] = [list(range(len(path))) for path in paths]
+        for edit in group:
+            if edit.kind == ADD_CONTOUR:
+                added_contours.append(edit)
+                continue
+            if edit.kind == REMOVE_CONTOUR:
+                removed_contours.add(edit.path)
+                continue
+            if edit.kind not in (INSERT_NODE, DELETE_NODE, MOVE_NODE, RETYPE_NODE):
+                return None
+            if not 0 <= edit.path < len(lists):
+                return None
+            nodes = lists[edit.path]
+            if edit.kind == INSERT_NODE:
+                if not 0 <= edit.index <= len(nodes):
+                    return None
+                nodes.insert(edit.index, [edit.position, edit.node_type])
+                continue
+            if not 0 <= edit.index < len(nodes):
+                return None
+            token = nodes[edit.index]
+            if edit.kind == DELETE_NODE:
+                del nodes[edit.index]
+                if isinstance(token, int):
+                    deletes.add((edit.path, token))
+            elif edit.kind == MOVE_NODE and isinstance(token, list):
+                token[0] = edit.position
+            elif edit.kind == RETYPE_NODE and isinstance(token, list):
+                token[1] = edit.node_type
+            elif edit.kind == MOVE_NODE:
+                if moves.setdefault((edit.path, token), edit.position) != edit.position:
+                    return None
+            elif retypes.setdefault((edit.path, token), edit.node_type) != edit.node_type:
+                return None
+        for path, nodes in enumerate(lists):
+            after = -1
+            run: list[list] = []
+            for token in [*nodes, len(paths[path])]:
+                if isinstance(token, list):
+                    run.append(token)
+                    continue
+                if run:
+                    if (path, after) in runs:
+                        return None
+                    runs[(path, after)] = run
+                    run = []
+                after = token
+
+    final: list[list] = []
+    for path, nodes in enumerate(paths):
+        sequence: list = list(runs.get((path, -1), []))
+        for index in range(len(nodes)):
+            sequence.append(index)
+            sequence.extend(runs.get((path, index), []))
+        final.append(sequence)
+    inserts, settings, removals = [], [], []
+    for path, sequence in enumerate(final):
+        for index, token in enumerate(sequence):
+            if isinstance(token, list):
+                inserts.append(
+                    StructuralEdit(
+                        kind=INSERT_NODE,
+                        path=path,
+                        index=index,
+                        position=token[0],
+                        node_type=token[1],
+                    )
+                )
+                continue
+            ref = (path, token)
+            if ref in moves:
+                settings.append(
+                    StructuralEdit(kind=MOVE_NODE, path=path, index=index, position=moves[ref])
+                )
+            if ref in retypes:
+                settings.append(
+                    StructuralEdit(kind=RETYPE_NODE, path=path, index=index, node_type=retypes[ref])
+                )
+            if ref in deletes:
+                removals.append(StructuralEdit(kind=DELETE_NODE, path=path, index=index))
+    remaining = len(paths) - len(removed_contours)
+    return (
+        *inserts,
+        *settings,
+        *reversed(removals),
+        *(
+            StructuralEdit(kind=REMOVE_CONTOUR, path=path, index=-1)
+            for path in sorted(removed_contours, reverse=True)
+        ),
+        *(replace(edit, path=remaining + k) for k, edit in enumerate(added_contours)),
+    )
+
+
+def _composed_edits(
+    axes: list[Axis], previous: Structure, structure: Structure, change: Change
+) -> tuple[StructuralEdit, ...] | None:
+    """With both mirrors on, ``change`` mirrored across each and through the
+    half-turn they compose to, so it reaches every quarter (Hugo, 2026-10-22:
+    "Adding a node with both mirrors should also add them on other axis").
+    None to leave it to the first axis that can place it: a node on an axis
+    has fewer than three images, and one of the three refuses."""
+    live = [axis for axis in axes if not axis_is_stale(axis, previous.paths)]
+    if len(live) != 2:
+        return None
+    turn = _composed(*live)
+    if turn is None:
+        return None
+    groups = [_mirrored(axis, previous, structure, change) for axis in (*live, turn)]
+    if not all(groups):
+        return None
+    return _merged(structure.paths, groups)
 
 
 def reconcile(
@@ -1501,10 +1731,13 @@ def reconcile(
         return ReconcileResult(axes=tuple(axes), edits=())
 
     edits: list[StructuralEdit] = []
-    if change.kind in MIRRORED_KINDS and _addressable(previous, structure, change):
-        # One change mirrored, by the first axis that can place it. Two composed
-        # symmetries should strictly produce three mirrored nodes; they produce
-        # one set, and the next change re-derives. Recorded as a known limit.
+    placeable = change.kind in MIRRORED_KINDS and _addressable(previous, structure, change)
+    if placeable and change.kind in (DELETED, DELETED_SEVERAL):
+        edits.extend(_mirror_deletes(axes, previous, change))
+    elif placeable and (composed := _composed_edits(axes, previous, structure, change)):
+        edits.extend(composed)
+    elif placeable:
+        # One change mirrored, by the first axis that can place it.
         for axis in axes:
             # Every index below is read out of this binding. If it no longer
             # describes even the PREVIOUS outline, it names nodes that moved

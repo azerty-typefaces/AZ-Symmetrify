@@ -13,9 +13,9 @@
 	<key>CFBundleName</key>
 	<string>AZ Symmetrify</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1</string>
+	<string>0.2</string>
 	<key>CFBundleVersion</key>
-	<string>0.1</string>
+	<string>0.2</string>
 	<key>GlyphsPluginIsLegacyType</key>
 	<false/>
 	<key>NSHumanReadableCopyright</key>

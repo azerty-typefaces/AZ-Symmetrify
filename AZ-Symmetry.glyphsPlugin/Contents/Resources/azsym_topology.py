@@ -38,10 +38,9 @@ def signature(structure: Structure) -> Signature:
     way an edit that moves nothing can reach the classifier at all.
 
     Node types are included in ORDER, not as a multiset, so reversing a contour
-    usually changes the signature. A contour whose type sequence is a
-    palindrome — a plain all-line rectangle, say — reverses without changing it.
-    That case falls through to the pair guard in azsym_sync and is recovered by
-    re-derivation, which is why the gate is allowed to be imperfect here.
+    usually changes the signature. One whose type sequence comes out the same —
+    an all-line contour reversed or given a new start node, two contours
+    swapped — does not change it, and ``renumbered`` is what catches those.
     """
     return tuple(
         (len(path), tuple(node_types))
@@ -52,12 +51,14 @@ def signature(structure: Structure) -> Signature:
 UNCHANGED = "unchanged"
 INSERTED = "inserted"
 DELETED = "deleted"
+DELETED_SEVERAL = "deleted-several"
 CURVE_SPLIT = "curve-split"
 CURVE_JOIN = "curve-join"
 SEGMENT_CURVED = "segment-curved"
 CONTOUR_ADDED = "contour-added"
 CONTOUR_REMOVED = "contour-removed"
 TYPE_CHANGED = "type-changed"
+RENUMBERED = "renumbered"
 UNCLASSIFIED = "unclassified"
 
 # The one node type that is not ON the curve. Everything else — line, curve,
@@ -154,6 +155,29 @@ class Change:
     path: int = -1
     index: int = -1
     node_type: str = ""
+    # DELETED_SEVERAL: every node removed, as (path, index) in the PREVIOUS
+    # frame, in path order.
+    removed: tuple[tuple[int, int], ...] = ()
+
+
+def renumbered(previous: Structure, current: Structure) -> bool:
+    """True when no node moved but nodes now sit at other indices: Make Node
+    First, Reverse Contours, a change of contour order. The nodes whose index
+    reads a new position hold, between them, exactly the positions and types
+    those indices held. A drag puts a node somewhere no node was; a single
+    changed index cannot be a renumbering."""
+    if [len(path) for path in previous.paths] != [len(path) for path in current.paths]:
+        return False
+    was: list[tuple[Point, str]] = []
+    now: list[tuple[Point, str]] = []
+    for before, after, types_before, types_after in zip(
+        previous.paths, current.paths, previous.types, current.types, strict=True
+    ):
+        for index, (old, new) in enumerate(zip(before, after, strict=True)):
+            if old != new:
+                was.append((old, types_before[index]))
+                now.append((new, types_after[index]))
+    return len(was) > 1 and sorted(was) == sorted(now)
 
 
 def _without(points: list[Point], index: int) -> list[Point]:
@@ -373,8 +397,48 @@ def classify(previous: Structure, current: Structure) -> Change:
 
     Returns UNCLASSIFIED rather than guessing when more than one thing changed.
     The caller re-derives the pairing in that case, which is both safe and the
-    right answer for the common multi-edit case of pasting a contour.
+    right answer for the common multi-edit case of pasting a contour. The one
+    multi-edit named is a selection of nodes deleted at once (DELETED_SEVERAL),
+    and only where no single edit explains the frame.
     """
+    change = _single_change(previous, current)
+    if change.kind == UNCLASSIFIED:
+        return _several_deleted(previous, current) or change
+    return change
+
+
+def _several_deleted(previous: Structure, current: Structure) -> Change | None:
+    """On-curve nodes removed and nothing else, two or more: every contour still
+    there, each the old one with nodes taken out, its other nodes where and what
+    they were. Re-deriving instead pairs an outline the deletes left lopsided,
+    and the whole contour stops mirroring (edge-case hunt, 2026-10-22). A
+    handle never goes alone: deleting one retypes its segment."""
+    if len(previous.paths) != len(current.paths):
+        return None
+    removed: list[tuple[int, int]] = []
+    for path_index, (before, after) in enumerate(zip(previous.paths, current.paths, strict=True)):
+        types_before, types_after = previous.types[path_index], current.types[path_index]
+        kept = 0
+        for index, point in enumerate(before):
+            if (
+                kept < len(after)
+                and close(point, after[kept])
+                and types_before[index] == types_after[kept]
+            ):
+                kept += 1
+            elif types_before[index] == OFFCURVE:
+                return None
+            else:
+                removed.append((path_index, index))
+        if kept != len(after):
+            return None
+    if len(removed) < 2:
+        return None
+    return Change(kind=DELETED_SEVERAL, removed=tuple(removed))
+
+
+def _single_change(previous: Structure, current: Structure) -> Change:
+    """``classify`` for one edit."""
     if len(current.paths) == len(previous.paths) + 1:
         index = _added_contour(previous.paths, current.paths)
         if index is None or _surviving_types_changed(previous.types, current.types, index):
@@ -410,7 +474,7 @@ def classify(previous: Structure, current: Structure) -> Change:
             )
         if len(retyped) > 1:
             return Change(kind=UNCLASSIFIED)
-        return Change(kind=UNCHANGED)
+        return Change(kind=RENUMBERED if renumbered(previous, current) else UNCHANGED)
     if len(changed) != 1:
         return Change(kind=UNCLASSIFIED)
 

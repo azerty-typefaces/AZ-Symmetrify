@@ -71,7 +71,7 @@ def moves_as(mode: str) -> str:
     return ROTATE if mode in _MIRROR_OF else mode
 
 
-def excluded_by(mode: str) -> tuple[str, ...]:
+def excluded_by(mode: str, italic: bool = False) -> tuple[str, ...]:
     """The symmetries that must come OFF when ``mode`` is switched on.
 
     Hugo, 2026-08-11: vertical OR/AND horizontal, THEN rotate. So the states a
@@ -87,11 +87,20 @@ def excluded_by(mode: str) -> tuple[str, ...]:
     offers only V + H). Two ways of spelling one state is how a switch row
     stops meaning anything.
 
+    On an ``italic`` master each symmetry excludes the other two (Hugo,
+    2026-10-22: "only one kind of symmetrie should be able to use in italic
+    layers"). A true italic round is point-symmetric only, so a mirror there may
+    bind as the half-turn (``TURNED``): two turned mirrors leave two quarters
+    copying only each other, and a turned one beside a mirror asks for the other
+    mirror, which the round does not have.
+
     Returns modes to RELEASE, so an unknown name excludes nothing rather than
     raising: this is reached from a menu click, and a typo must not cost the
     designer their bindings.
     """
     mode = switch_of(mode)
+    if italic and mode in (*MIRRORS, ROTATE):
+        return tuple(other for other in (*MIRRORS, ROTATE) if other != mode)
     if mode == ROTATE:
         return MIRRORS
     if mode in MIRRORS:
@@ -440,20 +449,21 @@ def half_plane(
     return _counterclockwise([low, high, (high[0] + offset, high[1]), (low[0] + offset, low[1])])
 
 
-def _clipped_to_ink(points: list[Point], origin: Point, direction: Point) -> tuple[Point, Point]:
-    """The stretch of a line through ``origin`` that lies inside the ink's box.
+def _clipped_to_ink(
+    across: tuple[float, float], up: tuple[float, float], origin: Point, direction: Point
+) -> tuple[Point, Point]:
+    """The stretch of a line through ``origin`` inside the box ``across`` by
+    ``up``: the ink's, widened to the layer's advance when ``axis_span`` has it.
 
     The diagonal cannot span the height the way an upright axis does: at one
     unit across per unit up, a tall narrow glyph — an ``l`` — would send it far
     out past both sides. Clipped to the box instead, it ends where the ink ends
     in whichever direction runs out first.
     """
-    xs = [x for x, _ in points]
-    ys = [y for _, y in points]
     low, high = -math.inf, math.inf
-    for start, step, least, most in (
-        (origin[0], direction[0], min(xs), max(xs)),
-        (origin[1], direction[1], min(ys), max(ys)),
+    for start, step, (least, most) in (
+        (origin[0], direction[0], across),
+        (origin[1], direction[1], up),
     ):
         if abs(step) < 1e-12:
             continue
@@ -524,6 +534,7 @@ def axis_span(
     mode: str,
     shear: float,
     split: Point | None = None,
+    width: float | None = None,
 ) -> tuple[Point, Point]:
     """The two ends of the drawn axis line, held to the glyph's own extent.
 
@@ -545,18 +556,28 @@ def axis_span(
     ``split`` is a half-turn's guide split (``axis_split``) when it was bound
     about one; the line is then drawn along the guide instead of the box
     diagonal.
+
+    ``width`` is the layer's advance, for a symmetry of the whole layer (Hugo,
+    2026-10-22: "extended dashed line to the width of the layer, not only to
+    bbox"). The extent then runs across from 0 to it as well as over the ink, so
+    a horizontal axis spans the sidebearings and a half-turn's line may reach
+    into them; a vertical axis still spans the ink's height. A zero-width layer
+    has no width to span.
     """
     origin = axis_origin(centre, shear)
     if not points:
         return origin, origin
     mode = switch_of(mode)
     dx, dy = axis_direction(mode, shear, split if split is not None else extent_of(points, shear))
-    if dy == 0.0:
-        xs = [x for x, _ in points]
-        return (min(xs), origin[1]), (max(xs), origin[1])
-    if mode == ROTATE:
-        return _clipped_to_ink(points, origin, (dx, dy))
+    xs = [x for x, _ in points]
     ys = [y for _, y in points]
+    across = (min(xs), max(xs))
+    if width:
+        across = (min(across[0], 0.0), max(across[1], width))
+    if dy == 0.0:
+        return (across[0], origin[1]), (across[1], origin[1])
+    if mode == ROTATE:
+        return _clipped_to_ink(across, (min(ys), max(ys)), origin, (dx, dy))
     return (
         (origin[0] + dx * (min(ys) - origin[1]), min(ys)),
         (origin[0] + dx * (max(ys) - origin[1]), max(ys)),

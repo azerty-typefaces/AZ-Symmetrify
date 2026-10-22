@@ -49,7 +49,7 @@ AZ Symmetrify is [GlyphsApp](https://glyphsapp.com/) to keeps a glyph symmetric 
   <img src="docs/images/vh.gif" alt="An o mirrored with the palette's two mirror switches" width="720">
 </p>
 
-**Mirror Horizontal** flips left over right, across a vertical axis: `A H T V x`. **Mirror Vertical** flips top over bottom, across a horizontal axis: `B E H`. Turn both on and one corner drives all four.
+**Mirror Horizontal** flips left over right, across a vertical axis: `A H T V x`. **Mirror Vertical** flips top over bottom, across a horizontal axis: `B E H`. Turn both on and one corner drives all four. On an italic master only one symmetry can be on at a time: the other switches grey out until you switch it off.
 
 Your selection decides which half you keep: the side that holds the selected nodes. With nothing selected it is the left half, or the bottom one. Hover a switch to read which way it will go, for example `Mirror Horizontal (Left → Right)`.
 
@@ -62,7 +62,7 @@ Your selection decides which half you keep: the side that holds the selected nod
 
 **Custom** pairs nodes diagonally opposite, a half-turn about the centre, and italics whose two sides curve the same way.
 
-It keeps one side of a line through the centre, set in the palette's **Diagonal** field in degrees, as Glyphs measures a guide's (0 along x, 90 upright). Empty is **Auto**: the line runs corner to corner across the glyph's bounding box, and the field shows that angle in grey. Type a number to choose your own.
+It keeps one side of a line through the centre, set in the palette's **Diagonal** field in whole degrees, as Glyphs measures a guide's (0 along x, 90 upright). Empty is **Auto**: the line runs corner to corner across the glyph's bounding box, and the field shows that angle in grey. Type a number to choose your own.
 
 | Key | Does |
 | --- | --- |
@@ -70,15 +70,15 @@ It keeps one side of a line through the centre, set in the palette's **Diagonal*
 | `⇧↑` `⇧↓` | Changes it by 10° |
 | `Return` | Applies the angle and turns Custom on |
 
-The glyph previews the new split while you type. Typing an angle is the instruction to reshape, so the switch stays clickable however far the half you keep would move, as long as every node pairs. Its tooltip says how far. The angle applies to that glyph in every master, until you close the document. 
+The glyph previews the new split while you type. Typing an angle is the instruction to reshape, so the switch stays clickable however far the half you keep would move, as long as every node pairs. Its tooltip says how far. The angle applies to that glyph in every master, until you close the document. Changing it is not an undo step: type the old angle back to restore it.
 
 <br>
 
-## Several Symmetries on One Glyph
+## Extra features
 
-Select whole paths, then click a switch: the symmetry covers only those paths, about the centre of their own box. A glyph can carry several this way, like the `S` of a `$` turned with **Custom** and its bar mirrored left to right.
+- **Swap Sides** : Once a switch is on, a little triangle beside its icon points at the half you draw: ◀ for the left, ▼ for the bottom, ◣ for the bottom left. Click the switch to draw the other half instead.
 
-Each symmetry shows its generated half in blue. Select its paths, or any node in them, to see its dashed axis, light its switches, and switch it off. A path belongs to one symmetry at a time.
+- **Several Symmetries on one layer** : Select whole paths, then click a switch: the symmetry covers only those paths, about the centre of their own box. A layer can carry several this way, like the `S` of a `$` turned with **Custom** and its bar mirrored left to right.
 
 <br>
 
