@@ -85,6 +85,7 @@ from GlyphsApp import (
     UPDATEINTERFACE,
     WINDOW_MENU,
     Glyphs,
+    GSGlyph,
     GSGuide,
     GSNode,
     GSPath,
@@ -7610,17 +7611,24 @@ PATHS_ELSEWHERE = (
 
 def _selection_by_path(layer) -> tuple[list[int], list[int]]:
     """(complete, touched): the paths whose every on-curve node is selected —
-    handles do not count — and the paths holding any selected node."""
+    handles do not count — and the paths holding any selected node.
+
+    ``layer.selection`` read once, as a set: ``node.selected`` reads it again
+    for every node, and the switch row asks this four times an update (Python
+    profile, 2026-10-30). The set compares as the selection's own
+    ``containsObject:`` does, by ``hash`` and ``isEqual:``.
+    """
     complete: list[int] = []
     touched: list[int] = []
     try:
+        selection = set(layer.selection or ())
         for index, path in enumerate(layer.paths):
             nodes = list(path.nodes)
-            if not any(node.selected for node in nodes):
+            if not any(node in selection for node in nodes):
                 continue
             touched.append(index)
             if all(
-                node.selected for node in nodes if _type_of(node) != azsym_topology.OFFCURVE
+                node in selection for node in nodes if _type_of(node) != azsym_topology.OFFCURVE
             ):
                 complete.append(index)
     except Exception:
@@ -8222,15 +8230,17 @@ def _upm_of_layer(layer) -> float:
 def _selected_nodes(layer) -> list:
     """Positions of the selected path nodes, ignoring anchors and components.
 
-    Walks the paths rather than reading ``layer.selection`` directly, because
+    Walks the paths rather than taking ``layer.selection`` as it is, because
     that collection also holds anchors and components, whose positions would
-    skew the which-side-is-the-source vote.
+    skew the which-side-is-the-source vote. Membership is tested against it
+    read once, as ``_selection_by_path`` does.
     """
     chosen: list = []
     try:
+        selection = set(layer.selection or ())
         for path in layer.paths:
             for node in path.nodes:
-                if node.selected:
+                if node in selection:
                     point = _read(node, _NODE_POSITION, "position")
                     chosen.append((point.x, point.y))
     except Exception:
@@ -9099,11 +9109,14 @@ def _open_step(layer) -> bool:
 
 def _glyph_of_undo(manager):
     """The glyph a GSUndoManager keeps the steps of; None for any other undo
-    manager, a text field's or a window's, which has no ``glyph``."""
+    manager, a text field's or a window's, which has no ``glyph``, and a
+    document's, whose ``glyph`` is the GSDocument (Glyphs 4202): its ObjC
+    ``layers`` getter is no GSGlyph's layer proxy."""
     try:
-        return manager.glyph()
+        glyph = manager.glyph()
     except Exception:
         return None
+    return glyph if isinstance(glyph, GSGlyph) else None
 
 
 def _apply_structure(
@@ -10155,8 +10168,18 @@ class AZSymmetryPalette(PalettePlugin):
         a guard on the button threw away the only notice the palette was going
         to get. Read from the running app: a row showing one mirror lit over a
         layer bound to both.
+
+        Nothing in a window off screen. A closed document's palette lives on —
+        the callback above holds its ``update``, so ``__del__`` never runs — in
+        its window, invisible and with no controller, and it refreshed the
+        front glyph for nobody: half the palette's cost (Python profile and
+        probe, Glyphs 4, 2026-10-30). No window at all is the fill ``settings``
+        does before Glyphs places the view, and that still runs.
         """
         try:
+            window = self.dialog.window()
+            if window is not None and not window.isVisible():
+                return
             layer = self._switch_layer()
             self._drawn = _sync_switches(self._switches, _PLUGIN, layer)
             self._refresh_triangles(_PLUGIN, layer)
