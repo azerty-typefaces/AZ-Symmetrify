@@ -59,6 +59,7 @@ from AppKit import (
     NSForegroundColorAttributeName,
     NSGraphicsContext,
     NSImage,
+    NSMenu,
     NSMenuItem,
     NSNotificationCenter,
     NSPoint,
@@ -76,7 +77,9 @@ from AppKit import (
     # NSAlert.h: NSAlertStyleWarning = 0, under its older spelling — the one
     # every macOS this plugin runs on has.
     NSWarningAlertStyle,
+    NSWorkspace,
 )
+from Foundation import NSURL
 from GlyphsApp import (
     DOCUMENTOPENED,
     DRAWFOREGROUND,
@@ -4611,138 +4614,20 @@ def _az_icon(point_size: float = 14.0):
 # ──────────────────────────────────────────────────────────────────────────────
 # The suite shows ONE item at the root of the Window menu — "AZ Toolkit" — with
 # every AZ plugin as a child, plus a link to the site at the bottom. Whichever
-# plugin loads first builds the submenu; the rest find it by title and insert
+# plugin loads first builds the submenu; the rest find it by tag and insert
 # themselves alphabetically, so load order never shows.
 #
 # Child titles drop the "AZ " prefix (the parent already says it), matching the
 # AZ Toolkit Settings hub, which labels its tabs the same way.
 #
-# This block is inlined identically in every AZ plugin — separate bundles share
-# no module — so KEEP THE COPIES IN SYNC.
+# Keep the shared parent tag and insertion behavior in sync with Letter Digger.
 
 AZ_TOOLKIT_MENU_TITLE = "AZ Toolkit"
 AZ_TOOLKIT_SITE_TITLE = "More AZ plugins…"
 AZ_TOOLKIT_SITE_URL = "https://azerty-typefaces.com"
-# NSMenuItem does not retain its target, and a plugin reload drops the module
-# global that would hold it — so the site link's target is parked on the main
-# thread's dictionary, which lives as long as the app does. Same rendezvous the
-# AZ Toolkit Settings hub uses ("AZToolkit.SettingsHub.v1").
-AZ_TOOLKIT_OPENER_KEY = "AZToolkit.WindowMenu.SiteOpener.v1"
-
-
-def _az_toolkit_title(name: str) -> str:
-    """A child item's label: the plugin name without its "AZ " prefix."""
-    return name[3:] if name.startswith("AZ ") else name
-
-
-def _az_toolkit_site_opener():
-    """The retained object behind "More AZ plugins…". One per app session."""
-    import objc
-    from AppKit import NSWorkspace
-    from Foundation import NSURL, NSObject, NSThread
-
-    store = NSThread.mainThread().threadDictionary()
-    opener = store.objectForKey_(AZ_TOOLKIT_OPENER_KEY)
-    if opener is not None:
-        return opener
-    try:
-        # Another AZ plugin already defined it: ObjC class names are global to
-        # the process and all Python plugins share one interpreter, so
-        # re-declaring the class raises instead of shadowing.
-        opener_class = objc.lookUpClass("AZToolkitSiteOpener")
-    except objc.error:
-
-        class AZToolkitSiteOpener(NSObject):
-            def openAZSite_(self, sender) -> None:
-                NSWorkspace.sharedWorkspace().openURL_(
-                    NSURL.URLWithString_(AZ_TOOLKIT_SITE_URL)
-                )
-
-        opener_class = AZToolkitSiteOpener
-    opener = opener_class.alloc().init()
-    store.setObject_forKey_(opener, AZ_TOOLKIT_OPENER_KEY)
-    return opener
-
-
-def _az_toolkit_menu():
-    """Find-or-create ``Window ▸ AZ Toolkit`` and return its NSMenu, or None if
-    the Window menu is not the shape we expect."""
-    from AppKit import NSImage, NSMenu, NSMenuItem
-
-    try:
-        window_menu = Glyphs.menu[WINDOW_MENU].submenu()
-        existing_items = list(window_menu.itemArray())
-    except Exception:
-        return None
-    for item in existing_items:
-        if str(item.title() or "") == AZ_TOOLKIT_MENU_TITLE:
-            return item.submenu()
-
-    submenu = NSMenu.alloc().initWithTitle_(AZ_TOOLKIT_MENU_TITLE)
-    parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        AZ_TOOLKIT_MENU_TITLE, None, ""
-    )
-    parent.setSubmenu_(submenu)
-    # The same symbol the AZ Toolkit pane carries in Settings, so the two
-    # surfaces read as one thing. Guarded: a host without SF Symbols has no
-    # such selector, and an icon is never worth losing the whole menu over.
-    try:
-        icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            "wrench.and.screwdriver", AZ_TOOLKIT_MENU_TITLE
-        )
-        if icon is not None:
-            icon.setTemplate_(True)
-            icon.setSize_((14.0, 14.0))  # menu-item icon metrics
-            parent.setImage_(icon)
-    except Exception:
-        pass
-
-    # Same reasoning as the icon: if the opener cannot be built the plugin items
-    # still belong in the menu, so only the link is dropped.
-    try:
-        site_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            AZ_TOOLKIT_SITE_TITLE, "openAZSite:", ""
-        )
-        site_item.setTarget_(_az_toolkit_site_opener())
-        submenu.addItem_(NSMenuItem.separatorItem())
-        submenu.addItem_(site_item)
-    except Exception:
-        pass
-
-    window_menu.addItem_(NSMenuItem.separatorItem())
-    window_menu.addItem_(parent)
-    return submenu
-
-
-def _install_az_toolkit_item(menu_item) -> None:
-    """Put a plugin's item in the AZ Toolkit submenu, alphabetically, above the
-    trailing separator + site link.
-
-    IDEMPOTENT BY TITLE: reloading a plugin while Glyphs runs calls ``start``
-    again on a menu that already holds the item, and AppKit will happily show
-    two of them.
-    """
-    from AppKit import NSMenuItem
-
-    submenu = _az_toolkit_menu()
-    if submenu is None:  # unexpected menu shape — do not lose the item
-        Glyphs.menu[WINDOW_MENU].append(NSMenuItem.separatorItem())
-        Glyphs.menu[WINDOW_MENU].append(menu_item)
-        return
-    title = str(menu_item.title() or "")
-    for existing in list(submenu.itemArray()):
-        if str(existing.title() or "") == title:
-            submenu.removeItem_(existing)
-    items = list(submenu.itemArray())
-    # The trailing separator is the end of the plugin block; the site link sits
-    # below it and always stays last.
-    end = next(
-        (i for i, item in enumerate(items) if item.isSeparatorItem()), len(items)
-    )
-    insert_at = next(
-        (i for i in range(end) if str(items[i].title() or "") > title), end
-    )
-    submenu.insertItem_atIndex_(menu_item, insert_at)
+# Shared toolkit tag for AZ plugins; Symmetrify's child-item tag is distinct.
+AZ_TOOLKIT_MENU_TAG = 0x415A544B  # AZTK
+AZ_SYMMETRIFY_MENU_TAG = 0x415A5359  # AZSY
 
 
 class AZSymmetry(GeneralPlugin):
@@ -5034,21 +4919,46 @@ class AZSymmetry(GeneralPlugin):
 
     @objc.python_method
     def _install_window_menu(self) -> None:
-        """Add ``Window ▸ AZ Toolkit ▸ Symmetrify``, which opens the plugin's window.
+        """Find or create ``Window ▸ AZ Toolkit ▸ Symmetrify`` by stable tags."""
+        window_menu = Glyphs.menu[WINDOW_MENU].submenu()
+        parent = window_menu.itemWithTag_(AZ_TOOLKIT_MENU_TAG)
+        if parent is None:
+            submenu = NSMenu.alloc().initWithTitle_(AZ_TOOLKIT_MENU_TITLE)
+            parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                AZ_TOOLKIT_MENU_TITLE, None, ""
+            )
+            parent.setTag_(AZ_TOOLKIT_MENU_TAG)
+            parent.setSubmenu_(submenu)
+            try:
+                icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    "wrench.and.screwdriver", AZ_TOOLKIT_MENU_TITLE
+                )
+                if icon is not None:
+                    icon.setTemplate_(True)
+                    icon.setSize_((14.0, 14.0))
+                    parent.setImage_(icon)
+            except Exception:
+                pass
 
-        The Window menu because that is what the item does — it opens a window —
-        and the AZ Toolkit submenu because the rest of the suite lands there too,
-        so eight plugins cost the Window menu one item instead of eight.
+            site_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                AZ_TOOLKIT_SITE_TITLE, "openAZSite:", ""
+            )
+            # GeneralPlugin instances live for the app session, so self remains
+            # a valid target even though NSMenuItem doesn't retain its target.
+            site_item.setTarget_(self)
+            submenu.addItem_(NSMenuItem.separatorItem())
+            submenu.addItem_(site_item)
+            window_menu.addItem_(parent)
 
-        Placement, dedupe on reload and the trailing site link all live in the
-        shared ``_install_az_toolkit_item`` block above.
-        """
+        submenu = parent.submenu()
+        item = submenu.itemWithTag_(AZ_SYMMETRIFY_MENU_TAG)
+        if item is not None:
+            return
+
         item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             WINDOW_ITEM_TITLE, "openWindow:", ""
         )
-        # A REAL selector on a target that is retained. The plugin instance is
-        # held by ``_PLUGIN`` for as long as Glyphs runs — an item whose target
-        # is collected is an item that silently greys out.
+        item.setTag_(AZ_SYMMETRIFY_MENU_TAG)
         item.setTarget_(self)
         item.setToolTip_(
             "Browse the layers that already use Symmetrify, or analyze the file "
@@ -5061,7 +4971,17 @@ class AZSymmetry(GeneralPlugin):
         icon = _az_icon(16.0) or _symmetry_icon(MENU_ICON_SYMMETRY, MENU_ICON_BOX)
         if icon is not None:
             item.setImage_(icon)
-        _install_az_toolkit_item(item)
+
+        # Walk only to find the alphabetical insertion point above the footer.
+        insert_at = submenu.numberOfItems()
+        for index, existing in enumerate(submenu.itemArray()):
+            if existing.isSeparatorItem() or str(existing.title() or "") > WINDOW_ITEM_TITLE:
+                insert_at = index
+                break
+        submenu.insertItem_atIndex_(item, insert_at)
+
+    def openAZSite_(self, sender) -> None:
+        NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(AZ_TOOLKIT_SITE_URL))
 
     def openWindow_(self, sender) -> None:
         """Open the window, on Browse — what the file already uses."""
